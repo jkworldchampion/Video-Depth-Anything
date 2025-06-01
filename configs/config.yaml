@@ -1,0 +1,9 @@
+hyper_parameter:
+  learning_rate: 1e-4
+  ratio_ssi: 1
+  ratio_tgm: 10
+  epochs: 50
+  patient: 5
+  batch_size: 2
+  conv_out_channel: 64
+  conv: true

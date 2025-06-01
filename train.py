@@ -5,6 +5,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torch.utils.data import DataLoader
 from data import VKITTIVideoDataset  # 클래스 이름 확인
+import yaml
+import wandb
+
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+from data.KITTI_dataloader import KITTIVideoDataset
+from torch.utils.data import DataLoader
+from utils.loss import Loss_ssi, Loss_tgm
+from torch.cuda.amp import autocast, GradScaler
+from video_depth_anything.video_depth import VideoDepthAnything
 
 def count_total_frames(video_dirs):
     """
@@ -128,5 +138,157 @@ def test_vkitti_dataloader_fullcount():
 
     print("\n테스트 완료!")
 
+def train():
+
+    ### 0. prepare GPU, wandb_login
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    #api_key = os.getenv("WANDB_API_KEY")
+    wandb.login(key="08198b7be027ddffa5241b9acf2f45cd4d42e993") # 너무 귀찮아서 그냥 공개
+
+
+    ### 1. Handling hyper_params with WAND :)
+    
+    config_path = "configs/config.yaml"
+    with open(config_path, "r") as file:
+        config = yaml.safe_load(file)
+
+    hyper_params = config["hyper_parameter"]
+    
+    run = wandb.init(project="Video_Depth_Anything", entity="mhroh01-ajou-university", config=hyper_params)
+
+    lr = hyper_params["learning_rate"]
+    ratio_ssi = hyper_params["ratio_ssi"]
+    ratio_tgm = hyper_params["ratio_tgm"]
+    num_epochs = hyper_params["epochs"]
+    patient = hyper_params["patient"]
+    batch_size = hyper_params["batch_size"]
+    conv_out_channel = hyper_params["conv_out_channel"]
+    conv = hyper_params["conv"]
+
+
+    ### 2. Load data
+
+    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"   
+    train_dataset = VKITTIVideoDataset(
+        root_dir=kitti_path,
+        clip_len=32,
+        resize_size=518,
+        use_rgb=False,
+        split="train"
+    )
+    val_dataset = VKITTIVideoDataset(
+        root_dir=kitti_path,
+        clip_len=32,
+        resize_size=518,
+        use_rgb=False,
+        split="val"
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+
+    ### 3. Model and additional stuffs,...
+
+    model = VideoDepthAnything(out_channel=conv_out_channel,conv=conv).to(device)
+    """
+    out_channel : result of diff-conv
+    conv : usage. False to use raw RGB diff
+    """
+    
+    # freeze -> pretrain은 DINO밖에 없어서 이렇게 가능 
+    for param in model.pretrained.parameters():
+        param.requires_grad = False
+
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=lr,weight_decay=1e-2)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print("Total parameters:", total_params)
+
+    loss_tgm = Loss_tgm()
+    loss_ssi = Loss_ssi()
+
+    wandb.watch(model, log="all")
+
+    best_val_loss = float('inf')
+    best_epoch = 0
+    trial = 0
+
+    scaler = GradScaler()
+
+    ### 4. train
+    
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0.0
+
+        for batch_idx,(x, y) in tqdm(enumerate(train_loader)):
+            x,y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            with autocast(dtype=torch.bfloat16):
+                pred = model(x)
+                loss = ratio_tgm * loss_tgm(pred,y) + ratio_ssi * loss_ssi(pred,y)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_loss += loss.item()
+
+            if batch_idx % 5 == 0:
+                print(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
+
+        avg_train_loss = epoch_loss / len(train_loader)
+        scheduler.step()
+
+        print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {epoch_loss:.4f}")
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch_idx,(x, y) in tqdm(enumerate(val_loader)):
+                x,y = x.to(device), y.to(device)
+                pred = model(x)
+                loss = ratio_tgm * loss_tgm(pred,y) + ratio_ssi * loss_ssi(pred,y)
+                val_loss += loss.item()
+
+            avg_val_loss = val_loss / len(val_loader)
+
+        print(f"Epoch [{epoch}/{num_epochs}] Validation Loss: {avg_val_loss:.4f}")
+
+        wandb.log({
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "epoch": epoch 
+        })
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(), 
+                'scaler_state_dict': scaler.state_dict()       
+            }, 'best_checkpoint.pth')
+            print(f"Best checkpoint saved at epoch {epoch} with validation loss {avg_val_loss:.4f}")
+            trial = 0
+        else:
+            trial += 1
+
+        if trial >= patient:
+            print("Early stopping triggered.")
+            break
+
+    print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
+    run.finish()
+
 if __name__ == "__main__":
     test_vkitti_dataloader_fullcount()
+    train()
+
+
+
+    
