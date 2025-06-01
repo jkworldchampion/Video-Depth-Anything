@@ -14,7 +14,8 @@ def test_kitti_dataloader():
     kitti_dataset = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=32,
-        resize_size=518
+        resize_size=518,
+        use_rgb=False  # RGB 이미지 사용
     )
     
     # 데이터셋 기본 정보 출력
