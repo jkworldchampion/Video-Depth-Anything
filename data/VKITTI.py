@@ -165,11 +165,15 @@ class KITTIVideoDataset(Dataset):
         depth_arr = np.array(depth_png, dtype=np.uint16).astype(np.float32)
         
         # 간단히 최대값으로 정규화 (상대적 깊이 관계 유지)
+        '''
         depth_max = np.max(depth_arr)
         if depth_max > 0:  # 0으로 나누기 방지
             depth_norm = depth_arr / depth_max
         else:
             depth_norm = depth_arr
+        '''
+        eps = 1e-8
+        depth_norm = 1/(depth_arr+eps)
         
         # 8비트 이미지로 변환
         depth_8u = (depth_norm * 255.0).astype(np.uint8)

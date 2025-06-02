@@ -1,1 +1,1 @@
-from .VKITTI import KITTIVideoDataset as VKITTIVideoDataset
+from .VKITTI import KITTIVideoDataset # as VKITTIVideoDataset
