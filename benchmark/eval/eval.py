@@ -72,7 +72,7 @@ def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
     for i in range(len(infer_paths)):
         if not os.path.exists(infer_paths[i]):
             continue
-        depth_gt = get_gt(depth_gt_paths[i], factors[i], args)
+        depth_gt = get_gt(depth_gt_paths[i], factors[i], args)  # get_gt(depth_gt_path, gt_factor, args):
         depth_gt = depth_gt[args.a:args.b, args.c:args.d]
         
         infer = get_infer(infer_paths[i], args, target_size=depth_gt.shape)
@@ -251,7 +251,7 @@ def main():
                 infer_paths = infer_paths[:args.max_eval_len]
                 depth_gt_paths = depth_gt_paths[:args.max_eval_len]
                 factors = factors[:args.max_eval_len]
-                results_single = eval_depthcrafter(infer_paths, depth_gt_paths, factors, args)
+                results_single = eval_depthcrafter(infer_paths, depth_gt_paths, factors, args)  # eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
                 results_all.append(results_single)
         final_results =  np.array(results_all)
         final_results_mean = np.mean(final_results, axis=0)
