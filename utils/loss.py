@@ -108,11 +108,11 @@ class Loss_tgm(nn.Module):
 
         ## 얘는 ssi loss랑 다르게, N이 좀 중요함. BxN으로 때리면 윈도우별 구분이 안가서 문제가 생김
 
-        loss_tgm = torch.zeros(())
+        loss_tgm = torch.zeros(()).to(pred.device)
 
 
         for idx in range(B):
-            temp = torch.zeros(())
+            temp = torch.zeros(()).to(pred.device)
             for d, d_next, g, g_next in zip(pred[idx][:-1], pred[idx][1:], y[idx][:-1], y[idx][1:]):
                 #print(d, d_next)
                 d_abs_diff = torch.abs(d - d_next)
