@@ -133,7 +133,7 @@ class KITTIVideoDataset(Dataset):
         mask_img = Image.fromarray((valid_mask * 255).astype(np.uint8), mode="L")
         disparity_img = disparity_img.convert("RGB")  # 3채널 변환
 
-        return disparity_img, mask_img
+        return disparity_img, mask_img, depth_m
 
     @staticmethod
     def load_camera_params(intrinsic_path, extrinsic_path):
@@ -235,14 +235,16 @@ class KITTIVideoDataset(Dataset):
         depth_clip = []
         masks = []
         frame_indices = []
+        true_depth_clip = []
 
         # 카메라 파라미터 로드 (두 개의 딕셔너리 반환)
         intrinsics_dict, extrinsics_dict = KITTIVideoDataset.load_camera_params(
             intrinsic_file, extrinsic_file
         )
 
-        intrinsics_list = []
-        extrinsics_list = []
+        # 카메라 파라미터를 미리 행렬 형태로 변환
+        extrinsics_matrices = []  # [clip_len, 4, 4] 형태로 저장
+        intrinsics_matrices = []  # [clip_len, 3, 3] 형태로 저장
 
         for i in range(self.clip_len):
             frame_idx = start_idx + i
@@ -263,7 +265,7 @@ class KITTIVideoDataset(Dataset):
             rgb_clip.append(rgb_tensor)
 
             # Depth + Mask 처리
-            disparity_img, mask_img = self.load_depth_image_with_mask(
+            disparity_img, mask_img, depth_m = self.load_depth_image_with_mask(
                 os.path.join(depth_path, depth_name)
             )
             depth_resized = TF.resize(disparity_img, self.resize_size)
@@ -273,22 +275,61 @@ class KITTIVideoDataset(Dataset):
             mask_resized = TF.resize(mask_img, self.resize_size, interpolation=Image.NEAREST)
             mask_cropped = TF.crop(mask_resized, crop_i, crop_j, crop_h, crop_w)
             mask_tensor = torch.from_numpy(np.array(mask_cropped)).float().unsqueeze(0)
+            
+            depth_m_img = Image.fromarray(depth_m)           # float32→PIL
+            depth_m_resized = TF.resize(depth_m_img, self.resize_size)
+            depth_m_cropped = TF.crop(depth_m_resized, crop_i, crop_j, crop_h, crop_w)
+            
+            true_depth_tensor = torch.from_numpy(np.array(depth_m_cropped)).float().unsqueeze(0)  # [1, H, W]
+            true_depth_clip.append(true_depth_tensor)  # 1채널 깊이(m)
 
             depth_clip.append(depth_tensor)
             masks.append(mask_tensor)
 
-            # 카메라 파라미터 조회
-            intr_p, extr_p = KITTIVideoDataset.get_camera_parameters(
+            # 카메라 파라미터 조회 및 행렬 변환
+            intr_params, extr_matrix = KITTIVideoDataset.get_camera_parameters(
                 frame_num, camera_idx, intrinsics_dict, extrinsics_dict
             )
-            intrinsics_list.append(intr_p)
-            extrinsics_list.append(extr_p)
+            
+            # Extrinsic 4x4 행렬 처리
+            if extr_matrix is not None:
+                extr_tensor = torch.tensor(extr_matrix, dtype=torch.float32)  # [4, 4]
+            else:
+                # 기본 단위 행렬
+                extr_tensor = torch.eye(4, dtype=torch.float32)
+                print(f"경고: 프레임 {frame_num}, 카메라 {camera_idx}에 대한 extrinsic 파라미터가 없습니다.")
+            
+            extrinsics_matrices.append(extr_tensor)
+            
+            # Intrinsic 3x3 행렬 처리
+            if intr_params is not None:
+                fx, fy, cx, cy = intr_params
+                K = torch.tensor([
+                    [fx, 0.0, cx],
+                    [0.0, fy, cy],
+                    [0.0, 0.0, 1.0]
+                ], dtype=torch.float32)  # [3, 3]
+            else:
+                # 기본 카메라 내부 파라미터
+                K = torch.tensor([
+                    [725.0087, 0.0, 620.5],
+                    [0.0, 725.0087, 187.0],
+                    [0.0, 0.0, 1.0]
+                ], dtype=torch.float32)
+                print(f"경고: 프레임 {frame_num}, 카메라 {camera_idx}에 대한 intrinsic 파라미터가 없습니다.")
+            
+            intrinsics_matrices.append(K)
 
         rgb_clip_tensor = torch.stack(rgb_clip)         # [clip_len, 3, H, W]
         depth_clip_tensor = torch.stack(depth_clip)     # [clip_len, 3, H, W]
         masks_tensor = torch.stack(masks)               # [clip_len, 1, H, W]
+        true_depth_tensor = torch.stack(true_depth_clip)        
 
         if self.split == "train":
             return rgb_clip_tensor, depth_clip_tensor, masks_tensor
         else:
-            return rgb_clip_tensor, depth_clip_tensor, masks_tensor, extrinsics_list, intrinsics_list
+            # 카메라 파라미터를 텐서로 변환
+            extrinsics_tensor = torch.stack(extrinsics_matrices)  # [clip_len, 4, 4]
+            intrinsics_tensor = torch.stack(intrinsics_matrices)  # [clip_len, 3, 3]
+            
+            return rgb_clip_tensor, depth_clip_tensor, masks_tensor,  true_depth_tensor, extrinsics_tensor, intrinsics_tensor

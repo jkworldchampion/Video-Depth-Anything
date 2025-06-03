@@ -45,7 +45,7 @@ class Loss_ssi(nn.Module):
         # print("d_hat y: ", self._d_hat(y))
         return torch.abs(self._d_hat(pred) - self._d_hat(y))
 
-    def forward(self, pred, y, disparity=True):
+    def forward(self, pred, y, masks_squeezed,disparity=True):
         """
         :param pred: Prediction per pixel. size : BxHxW
         :param y: Ground truth. size : BxHxW
@@ -60,6 +60,7 @@ class Loss_ssi(nn.Module):
         B, N, H, W = pred.shape
         pred = pred.view(-1, H * W)
         y = y.view(-1, H * W)
+        mask_flat = masks_squeezed.view(-1, H * W).bool()
 
         # print(pred.shape)
         # print(y.shape)
@@ -71,7 +72,7 @@ class Loss_ssi(nn.Module):
 
         ## group_1에 대해서는 그냥 일반 ssi loss 적용해주면 ok
 
-        y = self._normalize_depth(y)
+        #y = self._normalize_depth(y)
 
         """
         print("gt ( 1st element ):", y[0])
@@ -79,9 +80,15 @@ class Loss_ssi(nn.Module):
         print("y aggregation ( 1st element ):", torch.sum(y[0], dim=-1))
         print("pred aggregation ( 1st element ):", torch.sum(pred[0], dim=-1))
         """
+        
+        rho = self._rho(pred, y)  
+        rho[~mask_flat] = 0    
 
-        loss_ssi = torch.sum(self._rho(pred, y), dim=-1) / pred.shape[-1]
-        loss_ssi = loss_ssi.mean()
+        valid_counts = mask_flat.sum(dim=-1).clamp_min(1.0)
+        loss_per_image = rho.sum(dim=-1) / valid_counts
+        loss_ssi = loss_per_image.mean() 
+        
+        print("SSI Loss per batch:", loss_ssi)
 
         return loss_ssi
 
@@ -109,8 +116,7 @@ class Loss_tgm(nn.Module):
         ## 얘는 ssi loss랑 다르게, N이 좀 중요함. BxN으로 때리면 윈도우별 구분이 안가서 문제가 생김
 
         loss_tgm = torch.zeros(()).to(pred.device)
-
-
+        
         for idx in range(B):
             temp = torch.zeros(()).to(pred.device)
             for d, d_next, g, g_next in zip(pred[idx][:-1], pred[idx][1:], y[idx][:-1], y[idx][1:]):
@@ -118,11 +124,14 @@ class Loss_tgm(nn.Module):
                 d_abs_diff = torch.abs(d - d_next)
                 g_abs_diff = torch.abs(g - g_next)
                 #print(d_abs_diff)
-                temp += torch.sum(torch.abs(d_abs_diff - g_abs_diff))
+                diff = torch.abs(d_abs_diff - g_abs_diff) # shape: [H, W]
+                temp += torch.sum(diff) / (H * W)     
 
             loss_tgm += temp / (N - 1)
-
+            
         loss_tgm = loss_tgm / B
+        
+        print("TGM Loss per batch:", loss_tgm)
 
         return loss_tgm
 

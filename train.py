@@ -2,20 +2,27 @@
 import os
 import torch
 import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from torch.utils.data import DataLoader
-from data import KITTIVideoDataset  # 클래스 이름 확인
 import yaml
 import wandb
+import gc
 
+
+from torch.utils.data import DataLoader 
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from tqdm import tqdm
-from torch.utils.data import DataLoader
-from utils.loss import Loss_ssi, Loss_tgm
 from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
+from utils.loss import Loss_ssi, Loss_tgm
+from data import KITTIVideoDataset
 from video_depth_anything.video_depth import VideoDepthAnything
+from benchmark.eval.metric import *
+from benchmark.eval.eval_tae import tae_torch
+from benchmark.eval.eval import depth2disparity
+
+matplotlib.use('Agg')
+
+MAX_DEPTH=80.0
 
 def count_total_frames(video_infos):
     """
@@ -184,6 +191,92 @@ def test_vkitti_dataloader_fullcount():
 
     print("\n테스트 완료!")
 
+
+def metric_val(infs, disparity_gts, gts, valid_mask, poses, Ks):
+
+    """
+    least square 때문에, i & i+1 계산보다는 클립 하나를 통째로 계산하는 것이 올바름 
+    infs,gts : [clip_len, ~] 꼴을 기대, inf는 
+
+    지금 문제 : gt가 여기서는 진짜 gt를 기대하고있음 clipping 하기 전 ..
+    """
+
+    ### 1. preprocessing
+    infs = torch.clamp(infs, min=1e-3)
+    pred_disp_masked = infs[valid_mask].view(-1, 1).double()
+    disparity_gts_disp_masked = disparity_gts[valid_mask].view(-1, 1).double()
+
+    ### 2. least square
+    _ones = torch.ones_like(pred_disp_masked)
+    A = torch.cat([pred_disp_masked, _ones], dim=-1) 
+    X = torch.linalg.lstsq(A, disparity_gts_disp_masked).solution  
+    scale = X[0].item()
+    shift = X[1].item()
+    aligned_pred = scale * infs + shift
+    aligned_pred = torch.clamp(aligned_pred, min=1e-3)
+
+    ### 3. recovery
+    pred_depth = 1.0 / (aligned_pred+1e-8)
+    gt_depth = gts
+    pred_depth = torch.clamp(pred_depth, min=1e-3, max=MAX_DEPTH)
+
+    ### 4. validity
+    n = valid_mask.sum((-1, -2))
+    valid_frame = (n > 0)
+    pred_depth = pred_depth[valid_frame]
+    gt_depth = gt_depth[valid_frame]
+    valid_mask = valid_mask[valid_frame]
+
+    absrel = abs_relative_difference(pred_depth, gt_depth, valid_mask)
+    delta1 = delta1_acc(pred_depth, gt_depth, valid_mask)
+    #tae = eval_tae(pred_depth, poses, Ks, valid_mask)
+
+    return absrel,delta1
+
+
+def eval_tae(depth1, depth2, pose1, pose2, K1, K2, mask1, mask2):
+
+    device = depth1.device
+
+    # 1) pose1 → pose2 로 변환
+    T_1 = pose1.to(device)
+    T_2 = pose2.to(device)
+    T_2_inv = torch.linalg.inv(T_2)
+    T_2_1 = T_2_inv @ T_1       # 4×4
+
+    R_2_1 = T_2_1[:3, :3]       # [3, 3]
+    t_2_1 = T_2_1[:3,  3]       # [3]
+    
+    if mask1 is None:
+        mask1 = torch.ones_like(depth1, dtype=torch.bool, device=device)
+    if mask2 is None:
+        mask2 = torch.ones_like(depth2, dtype=torch.bool, device=device)
+
+    error1 = tae_torch(
+        depth1,      
+        depth2,       
+        R_2_1,       
+        t_2_1,      
+        K1.to(device),
+        mask2        
+    )
+
+    T_1_2 = torch.linalg.inv(T_2_1)
+    R_1_2 = T_1_2[:3, :3]
+    t_1_2 = T_1_2[:3,   3]
+
+    error2 = tae_torch(
+        depth2,  
+        depth1,       
+        R_1_2,       
+        t_1_2,
+        K2.to(device),
+        mask1         
+    )
+
+    result = 0.5 * (error1 + error2)
+    return result 
+
 def train():
 
     ### 0. prepare GPU, wandb_login
@@ -220,13 +313,13 @@ def train():
     # 2) 학습/검증 데이터셋 생성
     train_dataset = KITTIVideoDataset(
         root_dir=kitti_path,
-        clip_len=12,
+        clip_len=2,
         resize_size=518,
         split="train"
     )
     val_dataset = KITTIVideoDataset(
         root_dir=kitti_path,
-        clip_len=12,
+        clip_len=2,
         resize_size=518,
         split="val"
     )
@@ -272,11 +365,19 @@ def train():
 
         for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
             x, y, masks = x.to(device), y.to(device), masks.to(device)
+            
+            #print("x:", x)  # [B, T, C, H, W]
+            #print("y:", y)  # [B, T, 1, H, W]
+            #print("masks:", masks)  # [B, T, 1, H, W]
+            
             optimizer.zero_grad()
             
             with autocast(dtype=torch.float16):
                 pred = model(x)  # pred.shape == [B, T, H, W]
                 # masks.shape == [B, T, 1, H, W]
+                
+                #print("pred: ", pred)
+                print("pred.sum(): ", torch.sum(pred, dim=(2, 3)))  # 전체 예측값의 합계 출력
 
                 y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
 
@@ -288,7 +389,7 @@ def train():
                 y_masked    = y    * masks_squeezed
 
                 loss_tgm_val = loss_tgm(pred_masked, y_masked)
-                loss_ssi_val = loss_ssi(pred_masked, y_masked)
+                loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
                 
                 # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
@@ -310,33 +411,98 @@ def train():
 
         model.eval()
         val_loss = 0.0
+
+        total_absrel = 0.0
+        total_delta1 = 0.0
+        total_tae = 0.0
+        cnt_clip = 0
+
         with torch.no_grad():
-            for batch_idx, (x, y, masks, _, _) in tqdm(enumerate(val_loader)):
-                x, y, masks = x.to(device), y.to(device), masks.to(device)
+            for batch_idx, (x, y, masks, true_depth, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
+                x, y, masks,true_depth = x.to(device), y.to(device), masks.to(device), true_depth.to(device)
                 pred = model(x)
+                
+                y = y[:, :, 0, :, :]
 
-                # y: [B, T, 3, H, W] → 단일 채널로
-                y = y[:, :, 0, :, :]  # [B, T, H, W]
-                masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
+                ## 기억 안나서 그냥 추가 ;;...
+                ## loss 구할때는 거기서 차원 맞춰줬었는데, 여기는 직접 해주기. b len 1 h w 에서 1 제거 
 
-                pred_masked = pred * masks_squeezed
-                y_masked    = y    * masks_squeezed
+                if pred.dim() == 5 :
+                    pred = pred.squeeze(2)
 
+                B,clip_len,_,_ = pred.shape
+
+                if y.dim() == 5 :
+                    y = y.squeeze(2)
+
+                if masks.dim() == 5 :
+                    masks = masks.squeeze(2).bool()
+                    
+                if true_depth.dim() == 5:
+                    true_depth = true_depth.squeeze(2)
+                    
+                #print("extrinsics :",extrinsics_list)
+                #print("intrinsics :",intrinsics_list)
+                
+                poses = extrinsics.to(device)
+                Ks = intrinsics.to(device)
+                
+                print("true_depth:", true_depth)
+                print("true_depth.shape:", true_depth.shape)
+                
+                
+                for b in range(B):
+                    inf_clip   = pred[b]         # [clip_len, H, W]
+                    disparity_gt_clip = y[b]
+                    gt_clip    = true_depth[b]           
+                    mask_clip  = masks[b]      
+                    poses_clip = poses[b]      
+                    Ks_clip    = Ks[b]          
+
+                    absrel, delta1 = metric_val(
+                        inf_clip, disparity_gt_clip, gt_clip, mask_clip, poses_clip, Ks_clip
+                    )
+                    
+                    if(b+1 < B):
+                        tae = eval_tae(pred[b],pred[b+1],poses[b] , poses[b+1], Ks[b], Ks[b+1], masks[b], masks[b+1])
+                        total_tae += tae
+                    
+                    total_absrel += absrel
+                    total_delta1 += delta1
+                    cnt_clip += 1
+                    
+                # 검증 시에도 동일한 마스킹 적용
+                masks_expanded = masks.expand_as(pred)
+                pred_masked = pred * masks_expanded
+                y_masked = y * masks_expanded
+                masks_squeezed = masks.squeeze(2)
+                
+                # 손실 계산
                 loss_tgm_val = loss_tgm(pred_masked, y_masked)
-                loss_ssi_val = loss_ssi(pred_masked, y_masked)
+                loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
                 val_loss += loss.item()
             
             avg_val_loss = val_loss / len(val_loader)
+        
+            avg_absrel = total_absrel / cnt_clip
+            avg_delta1 = total_delta1 / cnt_clip
+            avg_tae = total_tae / (cnt_clip-1)
 
         print(f"Epoch [{epoch}/{num_epochs}] Validation Loss: {avg_val_loss:.4f}")
+        print(f"AbsRel  : {avg_absrel:.4f}")
+        print(f"Delta1  : {avg_delta1:.4f}")
+        print(f"TAE    : {avg_tae:.4f}")
 
         wandb.log({
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
-            "epoch": epoch 
+            "absrel": avg_absrel,
+            "delta1": avg_delta1,
+            "tae": avg_tae,
+            "epoch": epoch
         })
-
+        """
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_epoch = epoch
@@ -355,12 +521,13 @@ def train():
         if trial >= patient:
             print("Early stopping triggered.")
             break
+        """
 
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
     run.finish()
 
 if __name__ == "__main__":
-    # test_vkitti_dataloader_fullcount()
+    #test_vkitti_dataloader_fullcount()
     train()
 
 
