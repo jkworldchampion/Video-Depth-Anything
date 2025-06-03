@@ -275,21 +275,20 @@ def train():
             optimizer.zero_grad()
             
             with autocast(dtype=torch.float16):
-                pred = model(x)
-                
-                # 마스크 적용: 유효하지 않은 픽셀은 손실 계산에서 제외
-                # 마스크 확장 (B,T,1,H,W) -> (B,T,3,H,W)
-                masks_expanded = masks.expand_as(pred)
-                
-                # 유효 픽셀만 선택: 예측값과 타겟값에 마스크 적용
-                pred_masked = pred * masks_expanded
-                y_masked = y * masks_expanded
-                
-                # 손실 계산 (기존 함수 사용)
+                pred = model(x)  # pred.shape == [B, T, H, W]
+                # masks.shape == [B, T, 1, H, W]
+
+                y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
+
+                # ▶ 마스크 채널 축 제거
+                masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
+
+                # ▶ 유효 픽셀에만 곱하기
+                pred_masked = pred * masks_squeezed
+                y_masked    = y    * masks_squeezed
+
                 loss_tgm_val = loss_tgm(pred_masked, y_masked)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked)
-                
-                # 손실 합산
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
                 
                 # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
@@ -315,17 +314,17 @@ def train():
             for batch_idx, (x, y, masks, _, _) in tqdm(enumerate(val_loader)):
                 x, y, masks = x.to(device), y.to(device), masks.to(device)
                 pred = model(x)
-                
-                # 검증 시에도 동일한 마스킹 적용
-                masks_expanded = masks.expand_as(pred)
-                pred_masked = pred * masks_expanded
-                y_masked = y * masks_expanded
-                
-                # 손실 계산
+
+                # y: [B, T, 3, H, W] → 단일 채널로
+                y = y[:, :, 0, :, :]  # [B, T, H, W]
+                masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
+
+                pred_masked = pred * masks_squeezed
+                y_masked    = y    * masks_squeezed
+
                 loss_tgm_val = loss_tgm(pred_masked, y_masked)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked)
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
-                
                 val_loss += loss.item()
             
             avg_val_loss = val_loss / len(val_loader)
@@ -361,7 +360,7 @@ def train():
     run.finish()
 
 if __name__ == "__main__":
-    test_vkitti_dataloader_fullcount()
-    # train()
+    # test_vkitti_dataloader_fullcount()
+    train()
 
 
