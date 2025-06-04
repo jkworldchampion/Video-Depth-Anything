@@ -37,8 +37,8 @@ EMB_DIM = 384
 class VideoDepthAnything(nn.Module):
     def __init__(
         self,
-        encoder='vits',
-        features=256, 
+        encoder='vitl',
+        features=64, 
         out_channels=[256, 512, 1024, 1024], 
         use_bn=False, 
         use_clstoken=False,
@@ -57,10 +57,13 @@ class VideoDepthAnything(nn.Module):
         
         self.encoder = encoder
         #self.pretrained = DINOv2(model_name=encoder)
-        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-        
+        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+
+
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
         ###
+        
+        """
         
         self.conv = conv
         self.out_channel = out_channel
@@ -80,6 +83,8 @@ class VideoDepthAnything(nn.Module):
     
             
         self.mlp = nn.Conv2d(self.out_channel, EMB_DIM, kernel_size=1)
+        
+        """
 
     def forward(self, x):
         #print("x.shape :",x.shape)
@@ -88,7 +93,7 @@ class VideoDepthAnything(nn.Module):
         features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
 
         #print("f1",features[0][0].shape)
-        
+        """
         diff = []
 
         for idx in range(B):
@@ -151,7 +156,9 @@ class VideoDepthAnything(nn.Module):
         for feat, (_,cls) in zip(new_feat, features):
             updated_features.append((feat, cls))
 
-        depth = self.head(updated_features, patch_h, patch_w, T)
+
+        """
+        depth = self.head(features, patch_h, patch_w, T)
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
         return depth.squeeze(1).unflatten(0, (B, T)) # return shape [B, T, H, W]

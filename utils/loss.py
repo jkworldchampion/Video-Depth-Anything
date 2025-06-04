@@ -1,99 +1,79 @@
 import torch
 import torch.nn as nn
 
+import torch
+import torch.nn as nn
+
 class Loss_ssi(nn.Module):
     # DA와는 다르게, 들어오는 차원이 B x N x 1 x H x W 임 !!
-
+    # mask 차원 : [B, T, H, W]
     def __init__(self, eps=1e-8):
         super().__init__()
         self.eps = eps
 
-    def _normalize_depth(self, depth_tensor):
-        # min-max normalization
-        # per image
-        B_N, _ = depth_tensor.shape
-        normalized = torch.empty_like(depth_tensor)
-        for i in range(B_N):
-            img = depth_tensor[i]
-            min_val = img.min()
-            max_val = img.max()
-            normalized[i] = (img - min_val) / (max_val - min_val + self.eps)
-        return normalized
+    def _d_hat(self, d, mask):
+        ## 자 지금 d input : B , N , H , W 임 .
+        ## -> 일단 끝에 2차원에다가 각 마스크를 씌워줘야함
+        B, N, H, W = mask.shape
 
-    def _d_hat(self, d):
-        # 각 배치별 계산을 위해 dim 설정
-        # 여기서는 (BxN) x (HxW) 로 2차원이라고 가정
-        median, _ = torch.median(d, dim=-1)  # 이러면 나오는 결과 : (BxN) x1
-        # print(median)
-        t = median.unsqueeze(-1)
-        t = t.expand(-1, d.shape[-1])
+        flat_d    = d.view(B * N, H * W)
+        flat_mask = mask.view(B * N, H * W)
 
-        # t = torch.matmul(median.unsqueeze(0), t)
-        s = torch.sum(torch.abs(d - t), dim=-1) / (d.shape[-1]) + self.eps
-        # s : (BxN)x1 사이즈
+        medians = torch.zeros((B * N,), device=d.device, dtype=d.dtype)
+        scales  = torch.zeros((B * N,), device=d.device, dtype=d.dtype)
 
-        s = s.unsqueeze(-1).expand(-1, d.shape[-1])
-        # print("d : ", d)
-        # print("t : ", t)
-        # print("s : ", s)
-        # print("분자 : ", torch.sum(d - t, dim=-1))
+        for idx in range(B * N):
+            vec       = flat_d[idx] # H*W 짜리 1d 텐서
+            vec_mask  = flat_mask[idx]
 
-        return (d - t) / s
+            valid_vals = vec[vec_mask]   # 이러면 1차원 텐서 나옴
 
-    def _rho(self, pred, y):
-        # print("d_hat pred: ", self._d_hat(pred))
-        # print("d_hat y: ", self._d_hat(y))
-        return torch.abs(self._d_hat(pred) - self._d_hat(y))
+            if valid_vals.numel() == 0:
+                # 만약 valid 없을때 처리
+                med  = vec.new_tensor(0.0)
+                sc   = vec.new_tensor(self.eps)
+            else:
+                # t(d)
+                med = torch.median(valid_vals)  # -> 지금 valid_vals는 1d 텐서 여기서 median
+                # s(d)
+                abs_diff = torch.abs(valid_vals - med)
+                sc = abs_diff.mean() + self.eps  
 
-    def forward(self, pred, y, masks_squeezed,disparity=True):
-        """
-        :param pred: Prediction per pixel. size : BxHxW
-        :param y: Ground truth. size : BxHxW
-        """
+            medians[idx] = med  # (B*N) 차원 텐서
+            scales[idx]  = sc
 
-        if pred.dim() == 5 and pred.shape[2] == 1:  # depth map이라 1차원 앞에 있다면? - channel
+        median_matrix = medians.unsqueeze(1).expand(-1, H * W)  # (B*N, H*W)로 복원
+        scale_matrix  = scales.unsqueeze(1).expand(-1, H * W)
+
+        d_hat_flat = (flat_d - median_matrix) / scale_matrix
+
+        d_hat = d_hat_flat.view(B, N, H, W) ## 이러고 나면, scale과 median이 valid 기준으로 만들어짐 ! !
+
+        return d_hat
+
+    def _rho(self, pred, y, mask):
+        return torch.abs(self._d_hat(pred, mask) - self._d_hat(y, mask))
+
+    def forward(self, pred, y, masks_squeezed):
+        # mask 차원 : [B, T, H, W]
+        if pred.dim() == 5 and pred.shape[2] == 1:
             pred = pred.squeeze(2)
 
         if y.dim() == 5 and y.shape[2] == 1:
             y = y.squeeze(2)
+            
+        masks_squeezed =masks_squeezed.bool()  
 
-        B, N, H, W = pred.shape
-        pred = pred.view(-1, H * W)
-        y = y.view(-1, H * W)
-        mask_flat = masks_squeezed.view(-1, H * W).bool()
+        rho = self._rho(pred, y, masks_squeezed)        ## 리턴차원 : B T H W
+        rho[~masks_squeezed] = 0
 
-        # print(pred.shape)
-        # print(y.shape)
-
-        if not disparity:
-            ## 역수로 바꿔주기
-            temp = torch.ones_like(y)
-            y = temp / (y + self.eps)
-
-        ## group_1에 대해서는 그냥 일반 ssi loss 적용해주면 ok
-
-        #y = self._normalize_depth(y)
-
-        """
-        print("gt ( 1st element ):", y[0])
-        print("pred ( 1st element ):", pred[0])
-        print("y aggregation ( 1st element ):", torch.sum(y[0], dim=-1))
-        print("pred aggregation ( 1st element ):", torch.sum(pred[0], dim=-1))
-        """
-
-        
-        rho = self._rho(pred, y)  
-        rho[~mask_flat] = 0    
-
-        valid_counts = mask_flat.sum(dim=-1).clamp_min(1.0)
-        #print("Valid counts per image:", valid_counts)
+        valid_counts = masks_squeezed.sum(dim=-1).clamp_min(1.0)
         loss_per_image = rho.sum(dim=-1) / valid_counts
-        loss_ssi = loss_per_image.mean() 
-        
+        loss_ssi = loss_per_image.mean()
+
         print("SSI Loss per batch:", loss_ssi)
 
         return loss_ssi
-
 
 class Loss_tgm(nn.Module):
     def __init__(self):
@@ -150,7 +130,6 @@ class Loss_tgm(nn.Module):
 
                 diff_static = diff[static_region]  
                 sum_diff = diff_static.sum()               
-
 
                 tgm_pair = sum_diff / float(num_static)
 

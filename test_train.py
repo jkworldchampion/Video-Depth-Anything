@@ -200,14 +200,8 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
     infs,gts : [clip_len, ~] 꼴을 기대, inf는 
 
     지금 문제 : gt가 여기서는 진짜 gt를 기대하고있음 clipping 하기 전 ..
-    
-    LiheYoung씨가 rel-model인 경우에는 relative depth로 metric 해도 된다고 했음 
-    -> 일단 gt말고 disparity랑 least square 때리기
-
     """
 
-    valid_mask = valid_mask.bool()
-    
     ### 1. preprocessing
     
     infs = torch.clamp(infs, min=1e-3)
@@ -224,49 +218,33 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
     aligned_pred = scale * infs + shift
     aligned_pred = torch.clamp(aligned_pred, min=1e-3)
     
-    #print("aligned_pred : ",aligned_pred[0][0])
-    #print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
+    print("aligned_pred : ",aligned_pred[0][0])
+    print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
 
     ### 3. recovery
     
-    #depth = torch.zeros_like(aligned_pred)
-    #depth = 1.0 / aligned_pred
+    depth = torch.zeros_like(aligned_pred)
+    depth = 1.0 / aligned_pred
     
-    #gt_depth = gts
-    #pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
+    gt_depth = gts
+    pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
     
     #print("scaled_pred_depth : ",pred_depth[0][0])
     #print("gt_depth : ",gt_depth[0][0])
 
     ### 4. validity
-    
-    
-    pred_aligned_flat = aligned_pred[valid_mask]              # shape = (N_valid,)
-    gt_disp_flat      = disparity_gts[valid_mask]
-    
-    
-    absrel_per_pix = torch.abs(pred_aligned_flat - gt_disp_flat) / (gt_disp_flat + 1e-8)
-    absrel = absrel_per_pix.mean()
-
-    ratio = torch.max(pred_aligned_flat / (gt_disp_flat + 1e-8),gt_disp_flat / (pred_aligned_flat + 1e-8))
-    delta1 = (ratio < 1.25).float().mean()
-    
-
-    """
     n = valid_mask.sum((-1, -2))
     valid_frame = (n > 0)
-    pred_depth = aligned_pred[valid_frame]
-    gt_depth = disparity_gts[valid_frame]
+    pred_depth = pred_depth[valid_frame]
+    gt_depth = gt_depth[valid_frame]
     valid_mask = valid_mask[valid_frame]
     
     #print("valid_mask : ",valid_mask[0])
-    
 
     absrel = abs_relative_difference(pred_depth, gt_depth, valid_mask)
     delta1 = delta1_acc(pred_depth, gt_depth, valid_mask)
     #tae = eval_tae(pred_depth, poses, Ks, valid_mask)
-    """
-    
+
     return absrel,delta1
 
 
@@ -387,14 +365,14 @@ def train():
     
     
     # 2) 체크포인트 파일 로드
-    #model.load_state_dict(torch.load(f'video_depth_anything_vits.pth', map_location='cpu'), strict=True)
-    #model = model.to(device).eval()
+    model.load_state_dict(torch.load(f'video_depth_anything_vits.pth', map_location='cpu'), strict=True)
+    model = model.to(device).eval()
         
     # freeze -> pretrain은 DINO밖에 없어서 이렇게 가능 
     for param in model.pretrained.parameters():
         param.requires_grad = False
 
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=lr,weight_decay=1e-4)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=lr,weight_decay=1e-2)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -419,9 +397,9 @@ def train():
 
         for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
             x, y, masks = x.to(device), y.to(device), masks.to(device)
-            print("x.shape",x.shape)
-            print("y.shape",y.shape)
-            print("masks.shape",masks.shape)
+            #print("x.shape",x.shape)
+            #print("y.shape",y.shape)
+            #print("masks.shape",masks.shape)
             
             #print("x:", x)  # [B, T, C, H, W]
             #print("y:", y)  # [B, T, 1, H, W]
@@ -435,10 +413,8 @@ def train():
                 
                 #print("pred: ", pred)
                 #print("gt :", y)
-                print("pred.sum(): ", pred.sum())
+                #print("pred.sum(): ", pred.sum())
                 
-                #print("pred.isnan().any():", torch.isnan(pred).any().item())
-                #print("pred.isinf().any():", torch.isinf(pred).any().item())
                 #if pred.sum()==0:
                 #    print("pred_sum = 0, see GT : ",y[0][0])
 
@@ -451,9 +427,10 @@ def train():
                 pred_masked = pred * masks_squeezed
                 y_masked    = y    * masks_squeezed
 
-                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
+                #loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+                #loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+                loss = loss_ssi_val
                 
                 # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
                 # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
@@ -514,9 +491,9 @@ def train():
                 #print("true_depth.shape:", true_depth.shape)
                 #print("disparity_gt:", y[0])
                 #print("pred_depth : ",pred[0])
-                print("pred_sum", torch.sum(pred[0]))  # 전체 예측값의 합계 출력
-            
-            
+                #print("pred_sum", torch.sum(pred[0]))  # 전체 예측값의 합계 출력
+                
+                
                 with torch.no_grad():
                     B, T, C, H, W = x.shape
                     save_dir = f"outputs/frames/epoch_{epoch}_batch_{batch_idx}"
@@ -570,29 +547,6 @@ def train():
 
                     print(f"  → Epoch {epoch}, Batch {batch_idx} 저장: '{save_dir}'")
 
-                
-                for b in range(B):
-                    inf_clip   = pred[b]         # [clip_len, H, W]
-                    disparity_gt_clip = y[b]
-                    gt_clip    = true_depth[b]           
-                    mask_clip  = masks[b]      
-                    poses_clip = poses[b]      
-                    Ks_clip    = Ks[b]          
-
-                    absrel, delta1 = metric_val(
-                        inf_clip, disparity_gt_clip, gt_clip, mask_clip
-                    )
-                    """
-                    if(b+1 < B):
-                        tae = eval_tae(pred[b],pred[b+1],poses[b] , poses[b+1], Ks[b], Ks[b+1], masks[b], masks[b+1])
-                        total_tae += tae
-                    
-                    total_absrel += absrel
-                    total_delta1 += delta1
-                    
-                    """
-                    
-                    cnt_clip += 1
                     
                 # 검증 시에도 동일한 마스킹 적용
                 masks_expanded = masks.expand_as(pred)
@@ -601,30 +555,20 @@ def train():
                 masks_squeezed = masks.squeeze(2)
                 
                 # 손실 계산
-                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
+                #loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+                #loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+                loss = loss_ssi_val
                 val_loss += loss.item()
             
             avg_val_loss = val_loss / len(val_loader)
-        
-            avg_absrel = total_absrel / cnt_clip
-            avg_delta1 = total_delta1 / cnt_clip
-            #avg_tae = total_tae / (cnt_clip-1)
-
-        print(f"Epoch [{epoch}/{num_epochs}] Validation Loss: {avg_val_loss:.4f}")
-        print(f"AbsRel  : {avg_absrel:.4f}")
-        print(f"Delta1  : {avg_delta1:.4f}")
-        #print(f"TAE    : {avg_tae:.4f}")
 
         wandb.log({
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
-            "absrel": avg_absrel,
-            "delta1": avg_delta1,
             "epoch": epoch
         })
-        
+        """
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_epoch = epoch
@@ -643,7 +587,7 @@ def train():
         if trial >= patient:
             print("Early stopping triggered.")
             break
-    # 최종 모델 저장
+        """
 
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
     run.finish()

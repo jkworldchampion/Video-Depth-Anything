@@ -405,7 +405,7 @@ def DINOv2(model_name):
     
     return model_zoo[model_name](
         img_size=518,
-        patch_size=14,
+        patch_size=14,  
         init_values=1.0,
         ffn_layer="mlp" if model_name != "vitg" else "swiglufused",
         block_chunks=0,
