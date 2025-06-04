@@ -28,7 +28,7 @@ class KITTIVideoDataset(Dataset):
                  split="train",
                  rgb_mean=(0.485, 0.456, 0.406),
                  rgb_std=(0.229, 0.224, 0.225),
-                 min_depth=0.1,
+                 min_depth=0.001,
                  max_depth=80.0):
         super().__init__()
         assert split in ["train", "val"], "split은 'train' 또는 'val'이어야 합니다."

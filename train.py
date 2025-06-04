@@ -192,7 +192,7 @@ def test_vkitti_dataloader_fullcount():
     print("\n테스트 완료!")
 
 
-def metric_val(infs, disparity_gts, gts, valid_mask, poses, Ks):
+def metric_val(infs, disparity_gts, gts, valid_mask):
 
     """
     least square 때문에, i & i+1 계산보다는 클립 하나를 통째로 계산하는 것이 올바름 
@@ -202,11 +202,13 @@ def metric_val(infs, disparity_gts, gts, valid_mask, poses, Ks):
     """
 
     ### 1. preprocessing
+    
     infs = torch.clamp(infs, min=1e-3)
     pred_disp_masked = infs[valid_mask].view(-1, 1).double()
     disparity_gts_disp_masked = disparity_gts[valid_mask].view(-1, 1).double()
 
     ### 2. least square
+    
     _ones = torch.ones_like(pred_disp_masked)
     A = torch.cat([pred_disp_masked, _ones], dim=-1) 
     X = torch.linalg.lstsq(A, disparity_gts_disp_masked).solution  
@@ -214,11 +216,20 @@ def metric_val(infs, disparity_gts, gts, valid_mask, poses, Ks):
     shift = X[1].item()
     aligned_pred = scale * infs + shift
     aligned_pred = torch.clamp(aligned_pred, min=1e-3)
+    
+    print("aligned_pred : ",aligned_pred[0][0])
+    print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
 
     ### 3. recovery
-    pred_depth = 1.0 / (aligned_pred+1e-8)
+    
+    depth = torch.zeros_like(aligned_pred)
+    depth = 1.0 / aligned_pred
+    
     gt_depth = gts
-    pred_depth = torch.clamp(pred_depth, min=1e-3, max=MAX_DEPTH)
+    pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
+    
+    #print("scaled_pred_depth : ",pred_depth[0][0])
+    #print("gt_depth : ",gt_depth[0][0])
 
     ### 4. validity
     n = valid_mask.sum((-1, -2))
@@ -226,6 +237,8 @@ def metric_val(infs, disparity_gts, gts, valid_mask, poses, Ks):
     pred_depth = pred_depth[valid_frame]
     gt_depth = gt_depth[valid_frame]
     valid_mask = valid_mask[valid_frame]
+    
+    #print("valid_mask : ",valid_mask[0])
 
     absrel = abs_relative_difference(pred_depth, gt_depth, valid_mask)
     delta1 = delta1_acc(pred_depth, gt_depth, valid_mask)
@@ -324,7 +337,7 @@ def train():
         split="val"
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
 
@@ -366,29 +379,59 @@ def train():
         for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
             x, y, masks = x.to(device), y.to(device), masks.to(device)
             
+            
+            if epoch == 0 and batch_idx == 0:
+                import matplotlib.pyplot as plt
+                # CPU로 이동시키고 NumPy 변환
+                x_np = x[0].cpu().numpy()      # shape: [T, 3, H, W]
+                y_np = y[0, 0, 0].cpu().numpy()   # shape: [H, W] (첫 번째 프레임의 disparity)
+
+                # (1) 입력 RGB 시각화: 첫 번째 클립 첫 번째 프레임
+                rgb_frame = x_np[0].transpose(1, 2, 0)  # [H, W, 3]
+                # 정규화된 상태일 경우 원래 범위(0~1)로 클램핑
+                rgb_vis = np.clip(rgb_frame, 0, 1)
+
+                plt.figure(figsize=(6, 6))
+                plt.imshow(rgb_vis)
+                plt.title("Debug: Input X (Epoch 0, Batch 0) – First Clip, First Frame (RGB)")
+                plt.axis("off")
+                plt.savefig("debug_input_rgb.png", bbox_inches="tight")
+                plt.close()
+
+                # (2) GT Disparity 시각화: 첫 번째 클립 첫 번째 프레임
+                plt.figure(figsize=(6, 6))
+                plt.imshow(y_np, cmap="inferno")
+                plt.colorbar(label="Disparity")
+                plt.title("Debug: Ground Truth Y (Epoch 0, Batch 0) – First Clip, First Frame Disparity")
+                plt.axis("off")
+                plt.savefig("debug_gt_disparity.png", bbox_inches="tight")
+                plt.close()
+
             #print("x:", x)  # [B, T, C, H, W]
             #print("y:", y)  # [B, T, 1, H, W]
             #print("masks:", masks)  # [B, T, 1, H, W]
             
             optimizer.zero_grad()
             
-            with autocast(dtype=torch.float16):
+            with autocast():
                 pred = model(x)  # pred.shape == [B, T, H, W]
                 # masks.shape == [B, T, 1, H, W]
                 
                 #print("pred: ", pred)
-                print("pred.sum(): ", torch.sum(pred, dim=(2, 3)))  # 전체 예측값의 합계 출력
+                print("pred.sum(): ", pred.sum())
+                if pred.sum()==0:
+                    print("pred_sum = 0, see GT : ",y[0][0])
 
                 y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
 
-                # ▶ 마스크 채널 축 제거
+                # 마스크 채널 축 제거
                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
 
-                # ▶ 유효 픽셀에만 곱하기
+                # 유효 픽셀에만 곱하기
                 pred_masked = pred * masks_squeezed
                 y_masked    = y    * masks_squeezed
 
-                loss_tgm_val = loss_tgm(pred_masked, y_masked)
+                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
                 
@@ -400,6 +443,10 @@ def train():
             scaler.step(optimizer)
             scaler.update()
             epoch_loss += loss.item()
+            
+            if batch_idx == 0:
+                break
+              
 
             if batch_idx % 5 == 0:
                 print(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
@@ -447,8 +494,11 @@ def train():
                 poses = extrinsics.to(device)
                 Ks = intrinsics.to(device)
                 
-                print("true_depth:", true_depth)
+                print("true_depth:", true_depth[0][0])
                 print("true_depth.shape:", true_depth.shape)
+                print("disparity_gt:", y[0][0])
+                print("pred_depth : ",pred[0][0])
+                print("pred_sum", torch.sum(pred[0][0]))  # 전체 예측값의 합계 출력
                 
                 
                 for b in range(B):
@@ -460,7 +510,7 @@ def train():
                     Ks_clip    = Ks[b]          
 
                     absrel, delta1 = metric_val(
-                        inf_clip, disparity_gt_clip, gt_clip, mask_clip, poses_clip, Ks_clip
+                        inf_clip, disparity_gt_clip, gt_clip, mask_clip
                     )
                     
                     if(b+1 < B):
@@ -478,7 +528,7 @@ def train():
                 masks_squeezed = masks.squeeze(2)
                 
                 # 손실 계산
-                loss_tgm_val = loss_tgm(pred_masked, y_masked)
+                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
                 val_loss += loss.item()

@@ -80,11 +80,13 @@ class Loss_ssi(nn.Module):
         print("y aggregation ( 1st element ):", torch.sum(y[0], dim=-1))
         print("pred aggregation ( 1st element ):", torch.sum(pred[0], dim=-1))
         """
+
         
         rho = self._rho(pred, y)  
         rho[~mask_flat] = 0    
 
         valid_counts = mask_flat.sum(dim=-1).clamp_min(1.0)
+        #print("Valid counts per image:", valid_counts)
         loss_per_image = rho.sum(dim=-1) / valid_counts
         loss_ssi = loss_per_image.mean() 
         
@@ -97,44 +99,70 @@ class Loss_tgm(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, pred, y):
+    def forward(self, pred, y, masks_squeezed):
         """
-        train_code에서 넘어올 때를 생각해보자,, 분명 B x N x C x H x W 사이즈로 넘어오겠지? ( 여기선 overlapping x 일듯. )
-        pred, y : B x N x 1 x H x W
+        pred, y           : B x N x 1 x H x W  (disparity predictions and GT)
+        masks_squeezed    : B x N x H x W      (boolean mask of valid pixels)
         """
 
         if pred.dim() == 5 and pred.shape[2] == 1:
-            pred = pred.squeeze(2)
-
+            pred = pred.squeeze(2)      
         if y.dim() == 5 and y.shape[2] == 1:
-            y = y.squeeze(2)
+            y = y.squeeze(2)           
 
         B, N, H, W = pred.shape
-        pred = pred.view(B, N, H * W)
-        y = y.view(B, N, H * W)
+        pred_flat = pred.view(B, N, H * W)    
+        y_flat    = y.view(B, N, H * W)       
+        masks_flat = masks_squeezed.view(B, N, H * W).bool()  # → B x N x (H*W), bool
 
-        ## 얘는 ssi loss랑 다르게, N이 좀 중요함. BxN으로 때리면 윈도우별 구분이 안가서 문제가 생김
+        loss_tgm = torch.zeros((), device=pred.device)
 
-        loss_tgm = torch.zeros(()).to(pred.device)
-        
-        for idx in range(B):
-            temp = torch.zeros(()).to(pred.device)
-            for d, d_next, g, g_next in zip(pred[idx][:-1], pred[idx][1:], y[idx][:-1], y[idx][1:]):
-                #print(d, d_next)
-                d_abs_diff = torch.abs(d - d_next)
-                g_abs_diff = torch.abs(g - g_next)
-                #print(d_abs_diff)
-                diff = torch.abs(d_abs_diff - g_abs_diff) # shape: [H, W]
-                temp += torch.sum(diff) / (H * W)     
+        for b in range(B):
+            temp_b = torch.zeros((), device=pred.device)
 
-            loss_tgm += temp / (N - 1)
-            
-        loss_tgm = loss_tgm / B
-        
-        print("TGM Loss per batch:", loss_tgm)
+            for i in range(N - 1):
+                d_i      = pred_flat[b, i]     
+                d_next   = pred_flat[b, i + 1]   
+                g_i      = y_flat[b, i]  
+                g_next   = y_flat[b, i + 1]      
 
+                mask_i      = masks_flat[b, i]      
+                mask_next   = masks_flat[b, i + 1]   
+
+                # 두 프레임에 모두 valid한 픽셀만 고려
+                valid = mask_i & mask_next        
+                num_valid = valid.sum().item()
+
+                if num_valid == 0:
+                    continue
+
+                d_diff = torch.abs(d_next - d_i)             
+                g_diff = torch.abs(g_next - g_i)             
+
+                # 정적 영역: GT 차이가 0에 가까운 픽셀만 TGM에 포함!! |g_next - g| < 0.05
+                static_region = (torch.abs(g_next - g_i) < 0.05) & valid  
+                num_static = static_region.sum().item()
+
+                if num_static == 0:
+                    continue
+
+                diff = torch.abs(d_diff - g_diff)   
+
+                diff_static = diff[static_region]  
+                sum_diff = diff_static.sum()               
+
+
+                tgm_pair = sum_diff / float(num_static)
+
+                temp_b += tgm_pair
+
+            loss_tgm += temp_b / float(N - 1)
+
+
+        loss_tgm = loss_tgm / float(B)
+
+        print("TGM Loss per batch:", loss_tgm.item())
         return loss_tgm
-
 """
 
 # ─────────── dummy  ───────────

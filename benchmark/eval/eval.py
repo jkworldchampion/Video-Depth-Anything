@@ -11,8 +11,8 @@ import os
 import gc
 
 import torch
-from metric import *
-import metric
+from .metric import *
+#import metric
 
 device = 'cuda'
 eval_metrics = [
@@ -53,6 +53,7 @@ def get_flow(flow_path):
     assert os.path.exists(flow_path)
     flow = np.load(flow_path, allow_pickle=True)
     return flow
+
 def depth2disparity(depth, return_mask=False):
     if isinstance(depth, np.ndarray):
         disparity = np.zeros_like(depth)

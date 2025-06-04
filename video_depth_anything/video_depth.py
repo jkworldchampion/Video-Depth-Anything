@@ -56,8 +56,9 @@ class VideoDepthAnything(nn.Module):
         }
         
         self.encoder = encoder
-        self.pretrained = DINOv2(model_name=encoder)
-
+        #self.pretrained = DINOv2(model_name=encoder)
+        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+        
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
         ###
         
