@@ -62,7 +62,7 @@ class Loss_ssi(nn.Module):
         if y.dim() == 5 and y.shape[2] == 1:
             y = y.squeeze(2)
             
-        masks_squeezed =masks_squeezed.bool()  
+        masks_squeezed = masks_squeezed.bool()  
 
         rho = self._rho(pred, y, masks_squeezed)        ## 리턴차원 : B T H W
         rho[~masks_squeezed] = 0
@@ -71,7 +71,7 @@ class Loss_ssi(nn.Module):
         loss_per_image = rho.sum(dim=-1) / valid_counts
         loss_ssi = loss_per_image.mean()
 
-        print("SSI Loss per batch:", loss_ssi)
+        print("SSI Loss per batch:", loss_ssi.item())
 
         return loss_ssi
 

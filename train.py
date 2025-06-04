@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from utils.loss import Loss_ssi, Loss_tgm
+from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
 from data import KITTIVideoDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
@@ -24,6 +25,7 @@ from PIL import Image
 matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
+CLIP_LEN = 6
 
 def count_total_frames(video_infos):
     """
@@ -33,7 +35,7 @@ def count_total_frames(video_infos):
     total = 0
     for info in video_infos:  # video_pairs 대신 video_infos 사용
         rgb_path = info['rgb_path']  # 딕셔너리에서 키 접근
-        files = [f for f in os.listdir(rgb_path) 
+        files = [f for f in os.listdir(rgb_path)
                  if os.path.isfile(os.path.join(rgb_path, f)) 
                  and (f.lower().endswith(".png") or f.lower().endswith(".jpg"))]
         total += len(files)
@@ -205,8 +207,8 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
     -> 일단 gt말고 disparity랑 least square 때리기
 
     """
-
     valid_mask = valid_mask.bool()
+    
     
     ### 1. preprocessing
     
@@ -224,48 +226,36 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
     aligned_pred = scale * infs + shift
     aligned_pred = torch.clamp(aligned_pred, min=1e-3)
     
-    #print("aligned_pred : ",aligned_pred[0][0])
-    #print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
+    print("aligned_pred : ",aligned_pred[0][0])
+    print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
 
     ### 3. recovery
     
-    #depth = torch.zeros_like(aligned_pred)
-    #depth = 1.0 / aligned_pred
+    depth = torch.zeros_like(aligned_pred)
+    depth = 1.0 / aligned_pred
     
-    #gt_depth = gts
-    #pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
+    gt_depth = gts
+    pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
     
-    #print("scaled_pred_depth : ",pred_depth[0][0])
-    #print("gt_depth : ",gt_depth[0][0])
+    print("scaled_pred_depth : ",pred_depth[0][0])
+    print("mask", valid_mask[0][0])
+    print("gt_depth : ",gt_depth[0][0])
 
     ### 4. validity
-    
-    
-    pred_aligned_flat = aligned_pred[valid_mask]              # shape = (N_valid,)
-    gt_disp_flat      = disparity_gts[valid_mask]
-    
-    
-    absrel_per_pix = torch.abs(pred_aligned_flat - gt_disp_flat) / (gt_disp_flat + 1e-8)
-    absrel = absrel_per_pix.mean()
-
-    ratio = torch.max(pred_aligned_flat / (gt_disp_flat + 1e-8),gt_disp_flat / (pred_aligned_flat + 1e-8))
-    delta1 = (ratio < 1.25).float().mean()
-    
-
-    """
-    n = valid_mask.sum((-1, -2))
+    n = valid_mask.sum((-1, -2))    ## 인풋이 3차원이었으므로 T차원임
+    #print("n.shape: ", n.shape)
     valid_frame = (n > 0)
-    pred_depth = aligned_pred[valid_frame]
-    gt_depth = disparity_gts[valid_frame]
+    #print("pred_depth.shape: ", pred_depth.shape)
+    pred_depth = pred_depth[valid_frame]
+    gt_depth = gt_depth[valid_frame]
     valid_mask = valid_mask[valid_frame]
     
     #print("valid_mask : ",valid_mask[0])
     
-
     absrel = abs_relative_difference(pred_depth, gt_depth, valid_mask)
     delta1 = delta1_acc(pred_depth, gt_depth, valid_mask)
     #tae = eval_tae(pred_depth, poses, Ks, valid_mask)
-    """
+
     
     return absrel,delta1
 
@@ -349,13 +339,13 @@ def train():
     # 2) 학습/검증 데이터셋 생성
     train_dataset = KITTIVideoDataset(
         root_dir=kitti_path,
-        clip_len=4,
+        clip_len=CLIP_LEN,
         resize_size=518,
         split="train"
     )
     val_dataset = KITTIVideoDataset(
         root_dir=kitti_path,
-        clip_len=4,
+        clip_len=CLIP_LEN,
         resize_size=518,
         split="val"
     )
@@ -366,7 +356,7 @@ def train():
 
     ### 3. Model and additional stuffs,...
 
-    model = VideoDepthAnything(out_channel=conv_out_channel,conv=conv).to(device)
+    model = VideoDepthAnything(num_frames=CLIP_LEN,out_channel=conv_out_channel,conv=conv).to(device)
     """
     out_channel : result of diff-conv
     conv : usage. False to use raw RGB diff
@@ -402,6 +392,7 @@ def train():
 
     loss_tgm = Loss_tgm()
     loss_ssi = Loss_ssi()
+    # loss_ssi = MaskedScaleShiftInvariantLoss  # 이건 MiDaS 버전
 
     wandb.watch(model, log="all")
 
@@ -409,59 +400,64 @@ def train():
     best_epoch = 0
     trial = 0
 
-    scaler = GradScaler()
+    #scaler = GradScaler()
 
     ### 4. train
     
+    model.train()
     for epoch in range(num_epochs):
-        model.train()
         epoch_loss = 0.0
 
         for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
-            x, y, masks = x.to(device), y.to(device), masks.to(device)
-            print("x.shape",x.shape)
-            print("y.shape",y.shape)
-            print("masks.shape",masks.shape)
+            x, y = x.to(device), y.to(device)
+            masks = masks.bool()
+            masks = masks.to(device)
+            #print("x.shape",x.shape)
+            #print("y.shape",y.shape)
+            #print("masks.shape",masks.shape)
             
             #print("x:", x)  # [B, T, C, H, W]
             #print("y:", y)  # [B, T, 1, H, W]
             #print("masks:", masks)  # [B, T, 1, H, W]
             
+            y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
+
             optimizer.zero_grad()
+            #with autocast():
+            pred = model(x)  # pred.shape == [B, T, H, W]
+            # masks.shape == [B, T, 1, H, W]
             
-            with autocast():
-                pred = model(x)  # pred.shape == [B, T, H, W]
-                # masks.shape == [B, T, 1, H, W]
-                
-                #print("pred: ", pred)
-                #print("gt :", y)
-                print("pred.sum(): ", pred.sum())
-                
-                #print("pred.isnan().any():", torch.isnan(pred).any().item())
-                #print("pred.isinf().any():", torch.isinf(pred).any().item())
-                #if pred.sum()==0:
-                #    print("pred_sum = 0, see GT : ",y[0][0])
-
-                y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
-
-                # 마스크 채널 축 제거
-                masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
-
-                # 유효 픽셀에만 곱하기
-                pred_masked = pred * masks_squeezed
-                y_masked    = y    * masks_squeezed
-
-                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
-                loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
-                
-                # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
-                # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
-                # loss = (ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val) / (valid_pixel_ratio + 1e-8)
+            # 마스크 채널 축 제거
+            masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
+            #print("pred: ", pred)
+            #print("gt :", y)
+            print("pred.sum(): ", pred.sum().item())
             
+            #print("pred.isnan().any():", torch.isnan(pred).any().item())
+            #print("pred.isinf().any():", torch.isinf(pred).any().item())
+            #if pred.sum()==0:
+            #    print("pred_sum = 0, see GT : ",y[0][0])
+
+            # 유효 픽셀에만 곱하기
+            pred_masked = pred * masks_squeezed
+            y_masked    = y    * masks_squeezed
+
+            loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
+            loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
+            loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+            #loss = loss_ssi_val
+            
+            # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
+            # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
+            # loss = (ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val) / (valid_pixel_ratio + 1e-8)
+            """
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            """
+            loss.backward()
+            optimizer.step()
+            
             epoch_loss += loss.item()
 
             if batch_idx % 5 == 0:
@@ -477,13 +473,15 @@ def train():
 
         total_absrel = 0.0
         total_delta1 = 0.0
-        total_tae = 0.0
+        #total_tae = 0.0
         cnt_clip = 0
 
         with torch.no_grad():
             for batch_idx, (x, y, masks, true_depth, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
-                x, y, masks,true_depth = x.to(device), y.to(device), masks.to(device), true_depth.to(device)
+                x, y,true_depth = x.to(device), y.to(device),  true_depth.to(device)
                 pred = model(x)
+                masks = masks.bool()
+                masks = masks.to(device)
                 
                 y = y[:, :, 0, :, :]
 
@@ -514,7 +512,7 @@ def train():
                 #print("true_depth.shape:", true_depth.shape)
                 #print("disparity_gt:", y[0])
                 #print("pred_depth : ",pred[0])
-                print("pred_sum", torch.sum(pred[0]))  # 전체 예측값의 합계 출력
+                print("pred.sum(): ", pred.sum().item())
             
             
                 with torch.no_grad():
@@ -522,8 +520,8 @@ def train():
                     save_dir = f"outputs/frames/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
 
-                    with autocast():
-                        pred = model(x)
+                    #with autocast():
+                    pred = model(x)
                     # 이제 B=1 가정 → B 차원 제거
                     rgb_clip   = x[0]  # [T, 3, H, W]
                     disp_clip  = y[0]       # [T, 1, H, W]
@@ -548,7 +546,7 @@ def train():
 
                         # --- c) Mask 저장 ---
                         mask_frame = mask_clip[t]  # [1, H, W], 값 ∈ {0, 255}
-                        mask_np = mask_frame.squeeze(0).cpu().numpy().astype(np.uint8)  # [H, W]
+                        mask_np = (mask_frame.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)  # [H, W]
                         mask_pil = Image.fromarray(mask_np)
                         mask_out = os.path.join(save_dir, f"mask_frame_{t:02d}.png")
                         mask_pil.save(mask_out)
@@ -558,10 +556,7 @@ def train():
                         pred_frame = pred_clip[t].cpu().float().numpy()  # → np.float32, shape=[H, W]
                         # per-frame 정규화 (min/max) → [0,1]
                         pmin, pmax = pred_frame.min(), pred_frame.max()
-                        if pmax - pmin < 1e-6:
-                            pred_norm = np.zeros_like(pred_frame, dtype=np.float32)
-                        else:
-                            pred_norm = (pred_frame - pmin) / (pmax - pmin + 1e-8)
+                        pred_norm = (pred_frame - pmin) / (pmax - pmin+1e-9)
                         pred_uint8 = (pred_norm * 255.0).astype(np.uint8)  # [H, W]
                         pred_rgb_np = np.stack([pred_uint8]*3, axis=-1)   # [H, W, 3]
                         pred_pil = Image.fromarray(pred_rgb_np)
@@ -573,7 +568,7 @@ def train():
                 
                 for b in range(B):
                     inf_clip   = pred[b]         # [clip_len, H, W]
-                    disparity_gt_clip = y[b]
+                    disparity_gt_clip = y[b]    # 이거 다 3차원 맞음 
                     gt_clip    = true_depth[b]           
                     mask_clip  = masks[b]      
                     poses_clip = poses[b]      
@@ -632,13 +627,13 @@ def train():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(), 
-                'scaler_state_dict': scaler.state_dict()       
+                'scheduler_state_dict': scheduler.state_dict(),    
             }, 'best_checkpoint.pth')
             print(f"Best checkpoint saved at epoch {epoch} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:
             trial += 1
+            #'scaler_state_dict': scaler.state_dict()   
 
         if trial >= patient:
             print("Early stopping triggered.")
