@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from utils.loss import Loss_ssi, Loss_tgm
-from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
+from utils.loss_MiDas import MaskedScaleShiftInvariantLoss, VectorizedLossTGM
 from data import KITTIVideoDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
@@ -25,7 +25,8 @@ from PIL import Image
 matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
-CLIP_LEN = 6
+CLIP_LEN = 4
+kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"  # 현재 우리 docker 안의 경로로 설정함
 
 def count_total_frames(video_infos):
     """
@@ -44,7 +45,7 @@ def count_total_frames(video_infos):
 def test_vkitti_dataloader_fullcount():
     # ------------------------------------------------------------------------
     # 1) 데이터셋 루트 경로 (환경에 맞게 수정)
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"  # 현재 우리 docker 안의 경로로 설정함
+    kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"  # 현재 우리 docker 안의 경로로 설정함
 
     print(f"데이터셋 루트 경로: {kitti_path}\n")
 
@@ -334,7 +335,7 @@ def train():
 
     ### 2. Load data
 
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
+    kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"
 
     # 2) 학습/검증 데이터셋 생성
     train_dataset = KITTIVideoDataset(
@@ -383,6 +384,12 @@ def train():
     # freeze -> pretrain은 DINO밖에 없어서 이렇게 가능 
     for param in model.pretrained.parameters():
         param.requires_grad = False
+        
+    # ─── 여기서 DataParallel 적용 ─────────────────────────────────────
+    # 만약 GPU가 2대 이상이라면, 배치 기준으로 나눠서 계산
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
+        model = torch.nn.DataParallel(model)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=lr,weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -390,9 +397,10 @@ def train():
     total_params = sum(p.numel() for p in model.parameters())
     print("Total parameters:", total_params)
 
-    loss_tgm = Loss_tgm()
-    loss_ssi = Loss_ssi()
-    # loss_ssi = MaskedScaleShiftInvariantLoss  # 이건 MiDaS 버전
+#     loss_tgm = Loss_tgm()
+#     loss_ssi = Loss_ssi()
+    loss_ssi = MaskedScaleShiftInvariantLoss()  # 이건 MiDaS 버전
+    loss_tgm = VectorizedLossTGM() # vector화 연산을 통해 조금 더 빠르게
 
     wandb.watch(model, log="all")
 
@@ -409,9 +417,9 @@ def train():
         epoch_loss = 0.0
 
         for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
-            x, y = x.to(device), y.to(device)
-            masks = masks.bool()
-            masks = masks.to(device)
+            x = x.to(device, non_blocking=True)      # [B, T, C, H, W]
+            y = y.to(device, non_blocking=True)      # [B, T, 1, H, W]
+            masks = masks.to(device, non_blocking=True)  # [B, T, 1, H, W]
             #print("x.shape",x.shape)
             #print("y.shape",y.shape)
             #print("masks.shape",masks.shape)
@@ -444,6 +452,7 @@ def train():
 
             loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
             loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
+        
             loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
             #loss = loss_ssi_val
             
@@ -513,7 +522,6 @@ def train():
                 #print("disparity_gt:", y[0])
                 #print("pred_depth : ",pred[0])
                 print("pred.sum(): ", pred.sum().item())
-            
             
                 with torch.no_grad():
                     B, T, C, H, W = x.shape
@@ -635,9 +643,9 @@ def train():
             trial += 1
             #'scaler_state_dict': scaler.state_dict()   
 
-        if trial >= patient:
-            print("Early stopping triggered.")
-            break
+#         if trial >= patient:
+#             print("Early stopping triggered.")
+#             break
     # 최종 모델 저장
 
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
