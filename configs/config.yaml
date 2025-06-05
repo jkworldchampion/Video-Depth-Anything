@@ -1,9 +1,10 @@
 hyper_parameter:
-  learning_rate: 0.00001  # 1e-4 -> 1.0e-4 for float representation
+  learning_rate: 0.0001  # 1e-4 -> 1.0e-4 for float representation
+  clip_len: 16
   ratio_ssi: 1
   ratio_tgm: 10
-  epochs: 50
+  epochs: 500
   patient: 5
-  batch_size: 1
+  batch_size: 2
   conv_out_channel: 64
   conv: true

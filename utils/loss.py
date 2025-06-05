@@ -50,9 +50,10 @@ class Loss_ssi(nn.Module):
         d_hat = d_hat_flat.view(B, N, H, W) ## 이러고 나면, scale과 median이 valid 기준으로 만들어짐 ! !
 
         return d_hat
-
+    
     def _rho(self, pred, y, mask):
-        return torch.abs(self._d_hat(pred, mask) - self._d_hat(y, mask))
+        diff = self._d_hat(pred, mask) - self._d_hat(y, mask)
+        return diff ** 2
 
     def forward(self, pred, y, masks_squeezed):
         # mask 차원 : [B, T, H, W]
@@ -67,7 +68,7 @@ class Loss_ssi(nn.Module):
         rho = self._rho(pred, y, masks_squeezed)        ## 리턴차원 : B T H W
         rho[~masks_squeezed] = 0
 
-        valid_counts = masks_squeezed.sum(dim=-1).clamp_min(1.0)
+        valid_counts = masks_squeezed.sum(dim=-1).clamp_min(1.0)  # 이 부분에서 현재 W마다 mask가 적용된 픽셀을 계산
         loss_per_image = rho.sum(dim=-1) / valid_counts
         loss_ssi = loss_per_image.mean()
 
@@ -119,7 +120,7 @@ class Loss_tgm(nn.Module):
                 d_diff = torch.abs(d_next - d_i)             
                 g_diff = torch.abs(g_next - g_i)             
 
-                # 정적 영역: GT 차이가 0에 가까운 픽셀만 TGM에 포함!! |g_next - g| < 0.05
+                # 정적 영역 >> GT 차이가 0에 가까운 픽셀만 TGM에 포함!! |g_next - g| < 0.05
                 static_region = (torch.abs(g_next - g_i) < 0.05) & valid  
                 num_static = static_region.sum().item()
 

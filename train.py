@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from utils.loss import Loss_ssi, Loss_tgm
-from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
+# from utils.loss import Loss_ssi, Loss_tgm
+from utils.loss_MiDas import *
 from data import KITTIVideoDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
@@ -25,7 +25,6 @@ from PIL import Image
 matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
-CLIP_LEN = 6
 
 def count_total_frames(video_infos):
     """
@@ -194,7 +193,6 @@ def test_vkitti_dataloader_fullcount():
 
     print("\n테스트 완료!")
 
-
 def metric_val(infs, disparity_gts, gts, valid_mask):
 
     """
@@ -226,8 +224,8 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
     aligned_pred = scale * infs + shift
     aligned_pred = torch.clamp(aligned_pred, min=1e-3)
     
-    print("aligned_pred : ",aligned_pred[0][0])
-    print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
+    # print("aligned_pred : ",aligned_pred[0][0])
+    # print("disparity_gts_disp_masked" ,disparity_gts_disp_masked[0][0])
 
     ### 3. recovery
     
@@ -237,9 +235,9 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
     gt_depth = gts
     pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
     
-    print("scaled_pred_depth : ",pred_depth[0][0])
-    print("mask", valid_mask[0][0])
-    print("gt_depth : ",gt_depth[0][0])
+    # print("scaled_pred_depth : ",pred_depth[0][0])
+    # print("mask", valid_mask[0][0])
+    # print("gt_depth : ",gt_depth[0][0])
 
     ### 4. validity
     n = valid_mask.sum((-1, -2))    ## 인풋이 3차원이었으므로 T차원임
@@ -258,7 +256,6 @@ def metric_val(infs, disparity_gts, gts, valid_mask):
 
     
     return absrel,delta1
-
 
 def eval_tae(depth1, depth2, pose1, pose2, K1, K2, mask1, mask2):
 
@@ -330,6 +327,7 @@ def train():
     batch_size = hyper_params["batch_size"]
     conv_out_channel = hyper_params["conv_out_channel"]
     conv = hyper_params["conv"]
+    CLIP_LEN = hyper_params["clip_len"]
 
 
     ### 2. Load data
@@ -351,7 +349,7 @@ def train():
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
 
 
     ### 3. Model and additional stuffs,...
@@ -383,6 +381,11 @@ def train():
     # freeze -> pretrain은 DINO밖에 없어서 이렇게 가능 
     for param in model.pretrained.parameters():
         param.requires_grad = False
+    
+    # multi GPUs setting
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
+        model = torch.nn.DataParallel(model)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=lr,weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -392,20 +395,34 @@ def train():
 
     loss_tgm = Loss_tgm()
     loss_ssi = Loss_ssi()
-    # loss_ssi = MaskedScaleShiftInvariantLoss  # 이건 MiDaS 버전
+    # loss_ssi = Loss_ssi_mse()  # 이건 MiDaS 버전
 
     wandb.watch(model, log="all")
 
-    best_val_loss = float('inf')
-    best_epoch = 0
-    trial = 0
+    ### 4. 체크포인트 로딩(이어 학습)
+    checkpoint_path = "latest_checkpoint.pth"
+    start_epoch     = 0
+    best_val_loss   = float('inf')
+    best_epoch      = 0
+    trial           = 0
 
     #scaler = GradScaler()
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path} ...")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch   = ckpt["epoch"]
+        best_val_loss = ckpt["best_val_loss"]
+        best_epoch    = ckpt["best_epoch"]
+        trial         = ckpt["trial"]
+        print(f"Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, trial={trial}")
 
     ### 4. train
     
-    model.train()
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
+        model.train()
         epoch_loss = 0.0
 
         for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
@@ -444,8 +461,8 @@ def train():
 
             loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
             loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-            loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
-            #loss = loss_ssi_val
+            #loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+            loss = loss_ssi_val
             
             # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
             # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
@@ -480,6 +497,7 @@ def train():
             for batch_idx, (x, y, masks, true_depth, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
                 x, y,true_depth = x.to(device), y.to(device),  true_depth.to(device)
                 pred = model(x)
+                pred_cpu = pred.detach().cpu()  # GPU 메모리→CPU로 복사
                 masks = masks.bool()
                 masks = masks.to(device)
                 
@@ -491,7 +509,7 @@ def train():
                 if pred.dim() == 5 :
                     pred = pred.squeeze(2)
 
-                B,clip_len,_,_ = pred.shape
+                B,CLIP_LEN,_,_ = pred.shape
 
                 if y.dim() == 5 :
                     y = y.squeeze(2)
@@ -521,7 +539,7 @@ def train():
                     os.makedirs(save_dir, exist_ok=True)
 
                     #with autocast():
-                    pred = model(x)
+                    # pred = model(x)
                     # 이제 B=1 가정 → B 차원 제거
                     rgb_clip   = x[0]  # [T, 3, H, W]
                     disp_clip  = y[0]       # [T, 1, H, W]
@@ -620,24 +638,42 @@ def train():
             "epoch": epoch
         })
         
+        ### best 체크포인트 저장
+        is_best = False
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            best_epoch = epoch
+            best_epoch = epoch+1
+            is_best = True
             torch.save({
-                'epoch': epoch,
+                'epoch': epoch+1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),    
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'trial': trial,
             }, 'best_checkpoint.pth')
-            print(f"Best checkpoint saved at epoch {epoch} with validation loss {avg_val_loss:.4f}")
+            print(f"Best checkpoint saved at epoch {epoch+1} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:
             trial += 1
+
+        ### latest(이어학습용) 체크포인트 저장
+        torch.save({
+            'epoch': epoch+1,  # 다음에 이어 학습할 때 시작할 epoch
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'best_epoch': best_epoch,
+            'trial': trial,
+        }, checkpoint_path)
+
             #'scaler_state_dict': scaler.state_dict()   
 
-        if trial >= patient:
-            print("Early stopping triggered.")
-            break
+        # if trial >= patient:
+        #     print("Early stopping triggered.")
+        #     break
     # 최종 모델 저장
 
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")

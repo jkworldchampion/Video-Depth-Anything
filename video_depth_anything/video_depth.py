@@ -37,9 +37,9 @@ EMB_DIM = 384
 class VideoDepthAnything(nn.Module):
     def __init__(
         self,
-        encoder='vitl',
-        features=256, 
-        out_channels=[256, 512, 1024, 1024], 
+        encoder='vits',
+        features=64, 
+        out_channels=[48, 96, 192, 384], 
         use_bn=False, 
         use_clstoken=False,
         num_frames=32,
@@ -57,7 +57,7 @@ class VideoDepthAnything(nn.Module):
         
         self.encoder = encoder
         #self.pretrained = DINOv2(model_name=encoder)
-        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
     
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
