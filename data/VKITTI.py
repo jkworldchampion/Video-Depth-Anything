@@ -19,7 +19,7 @@ def get_random_crop_params(img, output_size):
     j = random.randint(0, w - tw)
     return i, j, th, tw
 
-
+    
 class KITTIVideoDataset(Dataset):
     def __init__(self,
                  root_dir,
@@ -130,6 +130,7 @@ class KITTIVideoDataset(Dataset):
             disparity_norm = disparity
 
         disparity_img = Image.fromarray((disparity_norm * 255.0).astype(np.uint8), mode="L")
+        # disparity_img = Image.fromarray ((disparity_norm), mode="F") 
         mask_img = Image.fromarray((valid_mask * 255).astype(np.uint8), mode="L")
         disparity_img = disparity_img.convert("RGB")  # 3채널 변환
 

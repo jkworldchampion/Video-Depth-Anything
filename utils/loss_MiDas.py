@@ -4,12 +4,6 @@
 import torch
 import torch.nn as nn
 
-import torch
-import torch.nn as nn
-
-import torch
-import torch.nn as nn
-
 class Loss_ssi(nn.Module):
     # DA와는 다르게, 들어오는 차원이 B x N x 1 x H x W 임 !!
     # mask 차원 : [B, T, H, W]

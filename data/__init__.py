@@ -1,1 +1,2 @@
-from .VKITTI import KITTIVideoDataset # as VKITTIVideoDataset
+from .VKITTI import KITTIVideoDataset
+from .Google_Landmark import GoogleLandmarksDataset, CombinedDataset

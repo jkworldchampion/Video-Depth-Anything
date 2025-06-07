@@ -13,9 +13,10 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from utils.loss import Loss_ssi, Loss_tgm
+from utils.loss_MiDas import Loss_ssi, Loss_tgm
 #from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
 from data.VKITTI import KITTIVideoDataset
+from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
 from benchmark.eval.eval_tae import tae_torch
@@ -170,21 +171,35 @@ def train():
     kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
 
     # 2) 학습/검증 데이터셋 생성
-    train_dataset = KITTIVideoDataset(
+    kitti_train = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=CLIP_LEN,
         resize_size=518,
         split="train"
     )
-    val_dataset = KITTIVideoDataset(
+    kitti_val = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=CLIP_LEN,
         resize_size=518,
         split="val"
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    train_dataset = CombinedDataset(
+        kitti_train,
+        google_image_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/images",
+        google_depth_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/depth",
+        output_size=518
+    )
+    val_dataset = CombinedDataset(
+        kitti_val,
+        google_image_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/images",
+        google_depth_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/depth",
+        output_size=518
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
 
 
     ### 3. Model and additional stuffs,...
@@ -233,6 +248,10 @@ def train():
             masks = masks.bool()
             masks = masks.to(device)
             
+            x_image    = x_image.to(device)
+            y_image    = y_image.to(device)
+            mask_image = mask_image.to(device)
+            
             if x_image.dim() == 4: # [B, C, H, W]
                 x_image = x_image.unsqueeze(1) # [B, T, C, H, W]
             if y_image.dim() == 3:  # [B, H, W]
@@ -247,15 +266,18 @@ def train():
             #print("x:", x)  # [B, T, C, H, W]
             #print("y:", y)  # [B, T, 1, H, W]
             #print("masks:", masks)  # [B, T, 1, H, W]
-            
-            y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
+            if y.dim() == 5:
+                y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
             
             optimizer.zero_grad()
             with autocast():
                 pred = model(x)  # pred.shape == [B, T, H, W]
                 # masks.shape == [B, T, 1, H, W]
-                pred_image = model(x_image)
-                
+                # x_image: [B, C, H, W] → [B, 1, C, H, W] 로 차원 확장
+                # if x_image.dim() == 4:
+                #     x_image = x_image.unsqueeze(1)
+                pred_image = model(x_image)         # 이제 [B, 1, H, W] 형태로 나옵니다.
+                        
                 # 마스크 채널 축 제거
                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
                 
@@ -322,7 +344,8 @@ def train():
         cnt_clip = 0
 
         with torch.no_grad():
-            for batch_idx, (x, y, masks, true_depth, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
+            for batch_idx, batch in tqdm(enumerate(val_loader)):
+                x, y, masks, true_depth, extrinsics, intrinsics = batch
                 x, y,true_depth = x.to(device), y.to(device),  true_depth.to(device)
                 pred = model(x)
                 masks = masks.bool()
