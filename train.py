@@ -157,6 +157,7 @@ def train():
     lr = hyper_params["learning_rate"]
     ratio_ssi = hyper_params["ratio_ssi"]
     ratio_tgm = hyper_params["ratio_tgm"]
+    ratio_ssi_image = hyper_params["ratio_ssi_image"]
     num_epochs = hyper_params["epochs"]
     patient = hyper_params["patient"]
     batch_size = hyper_params["batch_size"]
@@ -227,10 +228,18 @@ def train():
         
         model.train()
 
-        for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
+        for batch_idx, (x, y, masks, x_image, y_image, mask_image) in tqdm(enumerate(train_loader)):
             x, y = x.to(device), y.to(device)
             masks = masks.bool()
             masks = masks.to(device)
+            
+            if x_image.dim() == 4: # [B, C, H, W]
+                x_image = x_image.unsqueeze(1) # [B, T, C, H, W]
+            if y_image.dim() == 3:  # [B, H, W]
+                y_image = y_image.unsqueeze(1) # [B, T, H, W]
+            if mask_image.dim() == 3:   # [B, H, W]
+                mask_image = mask_image.unsqueeze(1)  # [B, T, H, W]
+                
             #print("x.shape",x.shape)
             #print("y.shape",y.shape)
             #print("masks.shape",masks.shape)
@@ -240,22 +249,25 @@ def train():
             #print("masks:", masks)  # [B, T, 1, H, W]
             
             y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
-
+            
             optimizer.zero_grad()
             with autocast():
                 pred = model(x)  # pred.shape == [B, T, H, W]
                 # masks.shape == [B, T, 1, H, W]
+                pred_image = model(x_image)
                 
                 # 마스크 채널 축 제거
                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
+                
                 #print("pred: ", pred)
                 #print("gt :", y)
-                print("pred.min(), pred.max(), pred.mean():", pred.min().item(), pred.max().item(), pred.mean().item())
+                print("video : pred.mean():", pred.mean().item())
+                print("image : pred.mean():", pred_image.mean().item())
                 #print("valid_mask.sum():", masks_squeezed.sum().item())
                 #print("y.sum():", y.sum().item())
                 #if pred.sum()== 0:
                 #print("pred_sum = 0, see GT : ",y[0][0])
-                    
+            
                 
                 #print("pred.isnan().any():", torch.isnan(pred).any().item())
                 #print("pred.isinf().any():", torch.isinf(pred).any().item())
@@ -265,10 +277,16 @@ def train():
                 # 유효 픽셀에만 곱하기
                 pred_masked = pred * masks_squeezed
                 y_masked    = y    * masks_squeezed
+                
+                pred_image_masked = pred_image * mask_image
+                y_image_masked    = y_image    * mask_image
 
                 loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+                
+                loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
+                
+                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val + ratio_ssi_image * loss_ssi_val_image
                 #loss = loss_ssi_val 
             
             # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
@@ -452,12 +470,13 @@ def train():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),    
+                'scaler_state_dict': scaler.state_dict(),
             }, 'best_checkpoint.pth')
             print(f"Best checkpoint saved at epoch {epoch} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:
             trial += 1
-            #'scaler_state_dict': scaler.state_dict()   
+            
         
         if trial >= patient:
             print("Early stopping triggered.")
