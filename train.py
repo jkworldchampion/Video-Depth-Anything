@@ -25,7 +25,6 @@ from PIL import Image
 matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
-CLIP_LEN = 2
 
 def metric_val(infs, gts, poses, Ks):
 
@@ -164,6 +163,7 @@ def train():
     batch_size = hyper_params["batch_size"]
     conv_out_channel = hyper_params["conv_out_channel"]
     conv = hyper_params["conv"]
+    CLIP_LEN = hyper_params["clip_len"]
 
 
     ### 2. Load data
@@ -188,17 +188,17 @@ def train():
         kitti_train,
         google_image_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/images",
         google_depth_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/depth",
-        output_size=518
+        #output_size=518
     )
     val_dataset = CombinedDataset(
         kitti_val,
         google_image_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/images",
         google_depth_root="/workspace/Video-Depth-Anything/datasets/google_landmarks/depth",
-        output_size=518
+        #output_size=518
     )
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
 
 
 
@@ -276,15 +276,16 @@ def train():
                 # x_image: [B, C, H, W] → [B, 1, C, H, W] 로 차원 확장
                 # if x_image.dim() == 4:
                 #     x_image = x_image.unsqueeze(1)
-                pred_image = model(x_image)         # 이제 [B, 1, H, W] 형태로 나옵니다.
+                #pred_image = model(x_image)         # 이제 [B, 1, H, W] 형태로 나옵니다.
                         
                 # 마스크 채널 축 제거
                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
                 
                 #print("pred: ", pred)
                 #print("gt :", y)
+                print("")
                 print("video : pred.mean():", pred.mean().item())
-                print("image : pred.mean():", pred_image.mean().item())
+                #print("image : pred.mean():", pred_image.mean().item())
                 #print("valid_mask.sum():", masks_squeezed.sum().item())
                 #print("y.sum():", y.sum().item())
                 #if pred.sum()== 0:
@@ -303,13 +304,20 @@ def train():
                 pred_image_masked = pred_image * mask_image
                 y_image_masked    = y_image    * mask_image
 
-                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
+                #loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
                 
-                loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
+                #print("pred_image_masked.shape:", pred_image_masked.shape)
+                #print("y_image_masked.shape:", y_image_masked.shape)
+                #print("pred_image", pred_image)
+                #print("single image : pred.mean():", pred_image.mean().item())
+                #print("y_image_", y_image)
+                #print("y_image.mean()", y_image.mean().item())
                 
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val + ratio_ssi_image * loss_ssi_val_image
-                #loss = loss_ssi_val 
+                #loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
+                
+                #loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val + ratio_ssi_image * loss_ssi_val_image
+                loss = loss_ssi_val 
             
             # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
             # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
@@ -324,16 +332,10 @@ def train():
             
             epoch_loss += loss.item()
 
-            if batch_idx % 5 == 0:
-                print(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
-            
         avg_train_loss = epoch_loss / len(train_loader)
         scheduler.step()
 
         print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {epoch_loss:.4f}")
-
-        wandb.log({"train_loss": avg_train_loss, "epoch": epoch})
-        
         
         model.eval()
         val_loss = 0.0
@@ -384,7 +386,7 @@ def train():
 
                 with torch.no_grad():
                     B, T, C, H, W = x.shape
-                    save_dir = f"outputs/test_train/frames/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/test_train/without_tgm/frames/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
 
                     #with autocast():
@@ -500,10 +502,11 @@ def train():
         else:
             trial += 1
             
-        
+        """
         if trial >= patient:
             print("Early stopping triggered.")
             break
+        """
     # 최종 모델 저장
 
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
