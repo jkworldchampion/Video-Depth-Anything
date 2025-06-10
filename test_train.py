@@ -26,7 +26,7 @@ from data.dataLoader import *
 matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
-CLIP_LEN = 16
+CLIP_LEN =16
 
 def least_sqaure_whole_clip(infs,gts):
     
@@ -39,7 +39,7 @@ def least_sqaure_whole_clip(infs,gts):
     ### 1. preprocessing
     valid_mask = (gts > 1e-3) & (gts < MAX_DEPTH)
     
-    gt_disp_masked = 1. / (gts[valid_mask].reshape((-1,1)).double() + 1e-8)
+    gt_disp_masked = 1. / (gts[valid_mask].reshape((-1,1)).double() + 1e-6)
     infs = infs.clamp(min=1e-3)
     pred_disp_masked = infs[valid_mask].reshape((-1,1)).double()
     
@@ -72,12 +72,12 @@ def least_sqaure_whole_clip(infs,gts):
     
     pred_depth = depth
     
-    return pred_depth
+    return pred_depth, valid_mask
 
 def metric_val(infs, gts, poses, Ks):
     
     gt_depth = gts
-    pred_depth =least_sqaure_whole_clip(infs,gts)
+    pred_depth, valid_mask = least_sqaure_whole_clip(infs,gts)
     
     ### 4. validity
     n = valid_mask.sum((-1, -2))    ## 인풋이 3차원이었으므로 T차원임
@@ -103,7 +103,7 @@ def metric_val(infs, gts, poses, Ks):
 def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
     
     error_sum = 0.
-    print("len_pred_depth : ",len(pred_depth))
+    #print("len_pred_depth : ",len(pred_depth))
     for i in range(len(pred_depth) - 1):
         depth1 = pred_depth[i]
         depth2 = pred_depth[i+1]
@@ -143,7 +143,7 @@ def get_mask(depth_m, min_depth, max_depth):
 
 def norm_ssi(depth, valid_mask):
     
-    eps=1e-8
+    eps=1e-6
     disparity = torch.zeros_like(depth)
     disparity[valid_mask] = 1.0 / depth[valid_mask]
 
@@ -169,7 +169,7 @@ def norm_ssi(depth, valid_mask):
     
     
 
-def train():
+def train(args):
 
     ### 0. prepare GPU, wandb_login
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -187,14 +187,20 @@ def train():
     run = wandb.init(project="Temporal_Diff_Flow_new", entity="Depth-Finder", config=hyper_params)
 
     lr = hyper_params["learning_rate"]
-    ratio_ssi = hyper_params["ratio_ssi"]
-    ratio_tgm = hyper_params["ratio_tgm"]
-    ratio_ssi_image = hyper_params["ratio_ssi_image"]
+    #ratio_ssi = hyper_params["ratio_ssi"]
+    #ratio_tgm = hyper_params["ratio_tgm"]
+    #ratio_ssi_image = hyper_params["ratio_ssi_image"]
     num_epochs = hyper_params["epochs"]
     patient = hyper_params["patient"]
     batch_size = hyper_params["batch_size"]
     conv_out_channel = hyper_params["conv_out_channel"]
     conv = hyper_params["conv"]
+    
+    ratio_ssi       = args.ratio_ssi
+    ratio_tgm       = args.ratio_tgm
+    ratio_ssi_image = args.ratio_ssi_image
+    exp_name        = args.exp_name
+    
 
 
     ### 2. Load data
@@ -206,7 +212,7 @@ def train():
         root_dir=kitti_path,
         data_name="kitti",
         split="train",
-        clip_len=16
+        clip_len=CLIP_LEN
     )
 
     kitti_train = KITTIVideoDataset(
@@ -220,7 +226,7 @@ def train():
         root_dir=kitti_path,
         data_name="kitti",
         split="val",
-        clip_len=16
+        clip_len=CLIP_LEN
     )
 
     kitti_val = KITTIVideoDataset(
@@ -344,7 +350,7 @@ def train():
                 video_masks_squeezed = video_masks.squeeze(2)
                 loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)   ## 어차피 5->4 는 loss에서 해줌 
                 
-                infs_fit = least_sqaure_whole_clip(infs=pred,gts=y)
+                infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)
                 loss_tgm_value = loss_tgm(infs_fit, y, video_masks_squeezed)
                 
                 # =============== single img =================== # 
@@ -375,6 +381,7 @@ def train():
                 print(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
             
         avg_train_loss = epoch_loss / len(train_loader)
+        
         scheduler.step()
 
         print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {avg_train_loss:.4f}")        
@@ -401,7 +408,7 @@ def train():
                 masks= masks.squeeze(2)
                 ssi_loss_value = loss_ssi(pred, disp_normed, masks)
                 
-                infs_fit = least_sqaure_whole_clip(infs=pred, gts=y)
+                infs_fit,_ = least_sqaure_whole_clip(infs=pred, gts=y)
                 tgm_loss_value = loss_tgm(infs_fit, y, masks)
 
                 loss = ratio_ssi * ssi_loss_value + ratio_tgm * tgm_loss_value
@@ -414,14 +421,14 @@ def train():
                 
                 with torch.no_grad():
                     B, T, C, H, W = x.shape
-                    save_dir = f"outputs/test_train/{agrs}/frames/test/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/test_train/{exp_name}/frames/test/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
 
                     #with autocast():
                     pred = model(x)
                     # 이제 B=1 가정 → B 차원 제거
                     rgb_clip   = x[0]  # [T, 3, H, W]
-                    disp_clip  = y[0]       # [T, 1, H, W]
+                    disp_clip  = disp_normed[0]       # [T, 1, H, W]
                     mask_clip  = masks[0]      # [T, 1, H, W]
                     pred_clip  = pred[0]       # [T, 1, H, W]
                     
@@ -433,10 +440,14 @@ def train():
                         rgb_out = os.path.join(save_dir, f"rgb_frame_{t:02d}.png")
                         rgb_pil.save(rgb_out)
 
-                        # --- b) GT Disparity 저장 ---
-                        disp_frame = disp_clip[t]  # [1, H, W], 값 ∈ [0,1]
-                        disp_np = (disp_frame.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)  # [H, W]
-                        disp_rgb_np = np.stack([disp_np]*3, axis=-1)  # [H, W, 3]
+                        #disp_frame = 1.0 / (disp_clip[t, 0] + 1e-6)          # [H, W]
+                        #print(disp_frame.min().item(), disp_frame.max().item())
+                        #disp_frame = disp_frame.clamp_(max=0.05) 
+                        #d_min, d_max = disp_frame[mask_clip[t]].min(), disp_frame[mask_clip[t]].max()
+                        #disp_norm = (disp_frame - d_min) / (d_max - d_min + 1e-9)
+                        
+                        disp_np = (disp_clip[t,0].cpu().numpy() * 255.0).astype(np.uint8)  # [H, W]
+                        disp_rgb_np = np.stack([disp_np] * 3, axis=-1)                # [H, W, 3]
                         disp_pil = Image.fromarray(disp_rgb_np)
                         disp_out = os.path.join(save_dir, f"disp_frame_{t:02d}.png")
                         disp_pil.save(disp_out)
@@ -469,13 +480,16 @@ def train():
                         pred_pil = Image.fromarray(pred_rgb_np)
                         pred_out = os.path.join(save_dir, f"pred_frame_norm_{t:02d}.png")
                         pred_pil.save(pred_out)
+                        
+                        if t == 0 :
+                            break
 
                     print(f"  → Epoch {epoch}, Batch {batch_idx} 저장: '{save_dir}'")
 
                 
                 for b in range(B):
                     inf_clip   = pred[b]         # [clip_len, H, W]
-                    gt_clip    = y[b]              
+                    gt_clip    = y[b].squeeze(1)            
                     poses_clip = poses[b]      
                     Ks_clip    = Ks[b]          
 
@@ -538,5 +552,37 @@ def train():
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
     run.finish()
 
+import argparse
+
+
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    args = parser.parse_args()
+
+    experiments = [
+        {"ratio_ssi": 1.0, "ratio_tgm": 0.0,  "ratio_ssi_image": 0.0},
+        {"ratio_ssi": 1.0, "ratio_tgm": 10.0, "ratio_ssi_image": 0.0},
+        {"ratio_ssi": 1.0, "ratio_tgm": 10.0, "ratio_ssi_image": 0.5},
+    ]
+
+    for exp in experiments:
+        for trial in range(3):  # 각 실험마다 3회 반복
+            # argparse 로 받은 기본 args 복사
+            run_args = argparse.Namespace(**vars(args))
+
+            # 실험별 파라미터 덮어쓰기
+            run_args.ratio_ssi       = exp["ratio_ssi"]
+            run_args.ratio_tgm       = exp["ratio_tgm"]
+            run_args.ratio_ssi_image = exp["ratio_ssi_image"]
+            run_args.trial           = trial
+
+            # exp_name에 trial 번호 포함
+            run_args.exp_name = (
+                f"ssi{run_args.ratio_ssi}"
+                f"_tgm{run_args.ratio_tgm}"
+                f"_ssiimg{run_args.ratio_ssi_image}"
+                f"_trial{trial}"
+            )
+
+            print(f"\n===== Starting experiment: {run_args.exp_name} =====")
+            train(run_args)
