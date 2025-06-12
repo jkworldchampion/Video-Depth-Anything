@@ -3,7 +3,7 @@ hyper_parameter:
   clip_len: 16
   ratio_ssi: 1
   ratio_tgm: 10
-  epochs: 500
+  epochs: 1000
   patient: 5
   batch_size: 2
   conv_out_channel: 64

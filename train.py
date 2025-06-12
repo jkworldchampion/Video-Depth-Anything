@@ -332,7 +332,7 @@ def train():
 
     ### 2. Load data
 
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
+    kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"
 
     # 2) 학습/검증 데이터셋 생성
     train_dataset = KITTIVideoDataset(
@@ -400,7 +400,7 @@ def train():
     wandb.watch(model, log="all")
 
     ### 4. 체크포인트 로딩(이어 학습)
-    checkpoint_path = "latest_checkpoint.pth"
+    checkpoint_path = "latest_tgm_checkpoint.pth"
     start_epoch     = 0
     best_val_loss   = float('inf')
     best_epoch      = 0
@@ -461,8 +461,8 @@ def train():
 
             loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
             loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-            #loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
-            loss = loss_ssi_val
+            loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+#             loss = loss_ssi_val
             
             # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
             # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
@@ -652,7 +652,7 @@ def train():
                 'best_val_loss': best_val_loss,
                 'best_epoch': best_epoch,
                 'trial': trial,
-            }, 'best_checkpoint.pth')
+            }, 'best_checkpoint_tgm.pth')
             print(f"Best checkpoint saved at epoch {epoch+1} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:

@@ -200,6 +200,10 @@ class KITTIVideoDataset(Dataset):
         P = K @ RT  # 3x4 투영행렬
         return P
 
+        
+    def is_image_file(self, filename):
+        return filename.lower().endswith(self.IMG_EXTENSIONS)
+    
     def __getitem__(self, idx):
         """
         하나의 비디오 클립을 로드하여 (rgb_clip, depth_clip, masks) 또는
@@ -211,9 +215,17 @@ class KITTIVideoDataset(Dataset):
         camera_idx = video_info['camera']
         intrinsic_file = video_info['intrinsic_file']
         extrinsic_file = video_info['extrinsic_file']
+        
+        self.IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
 
-        rgb_files = sorted(os.listdir(rgb_path))
-        depth_files = sorted(os.listdir(depth_path))
+        rgb_files   = sorted([
+            f for f in os.listdir(rgb_path)
+            if self.is_image_file(f) and os.path.isfile(os.path.join(rgb_path, f))
+        ])
+        depth_files = sorted([
+            f for f in os.listdir(depth_path)
+            if self.is_image_file(f) and os.path.isfile(os.path.join(depth_path, f))
+        ])
 
         if len(rgb_files) != len(depth_files):
             raise ValueError(f"RGB와 Depth의 개수가 일치하지 않습니다: {rgb_path}, {depth_path}")

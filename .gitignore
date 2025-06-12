@@ -5,3 +5,8 @@ __pycache__
 */__pycache__
 *.pyc
 gradio*
+datasets/
+wandb/
+*.pth
+.ipynb_checkpoints/
+*.ipynb_checkpoints
