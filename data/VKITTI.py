@@ -112,28 +112,43 @@ class KITTIVideoDataset(Dataset):
         return len(self.video_infos)
 
     def load_depth_image_with_mask(self, path):
-        """
-        Depth 이미지를 로드하여 disparity 이미지(PIL)와 마스크(PIL)를 반환합니다.
-        """
-        depth_png = Image.open(path)
-        depth_cm = np.array(depth_png, dtype=np.uint16).astype(np.float32)
-        depth_m = depth_cm / 100.0  # cm → m
+#         """
+#         Depth 이미지를 로드하여 disparity 이미지(PIL)와 마스크(PIL)를 반환합니다.
+#         """
+#         depth_png = Image.open(path)
+#         depth_cm = np.array(depth_png, dtype=np.uint16).astype(np.float32)
+#         depth_m = depth_cm / 100.0  # cm → m
 
-        valid_mask = np.logical_and((depth_m > self.min_depth), (depth_m < self.max_depth))
-        disparity = np.zeros_like(depth_m)
+#         valid_mask = np.logical_and((depth_m > self.min_depth), (depth_m < self.max_depth))
+#         disparity = np.zeros_like(depth_m)
+#         disparity[valid_mask] = 1.0 / depth_m[valid_mask]
+
+#         # [0,1] 범위로 정규화
+#         if np.max(disparity) > np.min(disparity):
+#             disparity_norm = (disparity - np.min(disparity)) / (np.max(disparity) - np.min(disparity) + 1e-8)
+#         else:
+#             disparity_norm = disparity
+
+#         disparity_img = Image.fromarray((disparity_norm * 255.0).astype(np.uint8), mode="L")
+#         mask_img = Image.fromarray((valid_mask * 255).astype(np.uint8), mode="L")
+#         disparity_img = disparity_img.convert("RGB")  # 3채널 변환
+
+#         return disparity_img, mask_img, depth_m
+
+        # 정규화 없애보기
+        # --- depth_m (float32, meter) 구하기 ---
+        depth_cm = np.array(Image.open(path), dtype=np.uint16).astype(np.float32)
+        depth_m  = depth_cm / 100.0  # cm→m
+
+        # --- valid mask & raw disparity (1/m) ---
+        valid_mask = (depth_m > self.min_depth) & (depth_m < self.max_depth)
+        disparity  = np.zeros_like(depth_m, dtype=np.float32)
         disparity[valid_mask] = 1.0 / depth_m[valid_mask]
 
-        # [0,1] 범위로 정규화
-        if np.max(disparity) > np.min(disparity):
-            disparity_norm = (disparity - np.min(disparity)) / (np.max(disparity) - np.min(disparity) + 1e-8)
-        else:
-            disparity_norm = disparity
+        # 이제 **raw** disparity 와 mask 만 리턴
+        # (정규화나 uint8 변환 NO)
+        return disparity, valid_mask, depth_m
 
-        disparity_img = Image.fromarray((disparity_norm * 255.0).astype(np.uint8), mode="L")
-        mask_img = Image.fromarray((valid_mask * 255).astype(np.uint8), mode="L")
-        disparity_img = disparity_img.convert("RGB")  # 3채널 변환
-
-        return disparity_img, mask_img, depth_m
 
     @staticmethod
     def load_camera_params(intrinsic_path, extrinsic_path):
@@ -276,27 +291,68 @@ class KITTIVideoDataset(Dataset):
             rgb_tensor = TF.normalize(rgb_tensor, mean=self.rgb_mean, std=self.rgb_std)
             rgb_clip.append(rgb_tensor)
 
-            # Depth + Mask 처리
-            disparity_img, mask_img, depth_m = self.load_depth_image_with_mask(
+#             # Depth + Mask 처리
+#             disparity_img, mask_img, depth_m = self.load_depth_image_with_mask(
+#                 os.path.join(depth_path, depth_name)
+#             )
+#             depth_resized = TF.resize(disparity_img, self.resize_size)
+#             depth_cropped = TF.crop(depth_resized, crop_i, crop_j, crop_h, crop_w)
+#             depth_tensor = TF.to_tensor(depth_cropped)
+
+#             mask_resized = TF.resize(mask_img, self.resize_size, interpolation=Image.NEAREST)
+#             mask_cropped = TF.crop(mask_resized, crop_i, crop_j, crop_h, crop_w)
+#             mask_tensor = torch.from_numpy(np.array(mask_cropped)).float().unsqueeze(0)
+            
+#             depth_m_img = Image.fromarray(depth_m)           # float32→PIL
+#             depth_m_resized = TF.resize(depth_m_img, self.resize_size)
+#             depth_m_cropped = TF.crop(depth_m_resized, crop_i, crop_j, crop_h, crop_w)
+            
+#             true_depth_tensor = torch.from_numpy(np.array(depth_m_cropped)).float().unsqueeze(0)  # [1, H, W]
+#             true_depth_clip.append(true_depth_tensor)  # 1채널 깊이(m)
+
+#             depth_clip.append(depth_tensor)
+#             masks.append(mask_tensor)
+
+            # Depth 처리 변경
+            # --- (1) raw disparity, mask, true depth(m) 불러오기 ---
+            disp, mask_bool, depth_m = self.load_depth_image_with_mask(
                 os.path.join(depth_path, depth_name)
             )
-            depth_resized = TF.resize(disparity_img, self.resize_size)
-            depth_cropped = TF.crop(depth_resized, crop_i, crop_j, crop_h, crop_w)
-            depth_tensor = TF.to_tensor(depth_cropped)
 
-            mask_resized = TF.resize(mask_img, self.resize_size, interpolation=Image.NEAREST)
-            mask_cropped = TF.crop(mask_resized, crop_i, crop_j, crop_h, crop_w)
-            mask_tensor = torch.from_numpy(np.array(mask_cropped)).float().unsqueeze(0)
-            
-            depth_m_img = Image.fromarray(depth_m)           # float32→PIL
-            depth_m_resized = TF.resize(depth_m_img, self.resize_size)
-            depth_m_cropped = TF.crop(depth_m_resized, crop_i, crop_j, crop_h, crop_w)
-            
-            true_depth_tensor = torch.from_numpy(np.array(depth_m_cropped)).float().unsqueeze(0)  # [1, H, W]
-            true_depth_clip.append(true_depth_tensor)  # 1채널 깊이(m)
+            # --- (2) numpy array → resize (PIL) → numpy → crop (numpy slicing) → tensor ---
+            # resize
+            disp_resized = np.array(
+                TF.resize(Image.fromarray(disp), self.resize_size),
+                dtype=np.float32
+            )                    # [resize, resize]
+            mask_resized = np.array(
+                TF.resize(
+                    Image.fromarray(mask_bool.astype(np.uint8)),
+                    self.resize_size,
+                    interpolation=Image.NEAREST
+                ),
+                dtype=np.float32
+            )
+            depthm_resized = np.array(
+                TF.resize(Image.fromarray(depth_m), self.resize_size),
+                dtype=np.float32
+            )
 
+            # crop: numpy 슬라이싱
+            di, dj, dh, dw = crop_i, crop_j, crop_h, crop_w
+            disp_crop   = disp_resized[di:di+dh, dj:dj+dw]
+            mask_crop   = mask_resized[di:di+dh, dj:dj+dw]
+            depthm_crop = depthm_resized[di:di+dh, dj:dj+dw]
+
+            # to tensor
+            depth_tensor      = torch.from_numpy(disp_crop).unsqueeze(0)   # [1, H, W]
+            mask_tensor       = torch.from_numpy(mask_crop).unsqueeze(0)   # [1, H, W]
+            true_depth_tensor = torch.from_numpy(depthm_crop).unsqueeze(0) # [1, H, W]
+
+            # 리스트에 추가
             depth_clip.append(depth_tensor)
             masks.append(mask_tensor)
+            true_depth_clip.append(true_depth_tensor)
 
             # 카메라 파라미터 조회 및 행렬 변환
             intr_params, extr_matrix = KITTIVideoDataset.get_camera_parameters(

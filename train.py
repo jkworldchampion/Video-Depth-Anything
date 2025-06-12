@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-# from utils.loss import Loss_ssi, Loss_tgm
-from utils.loss_MiDas import *
+from utils.loss_MiDas import Loss_ssi, Loss_tgm
 from data import KITTIVideoDataset
+from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
 from benchmark.eval.eval_tae import tae_torch
@@ -171,21 +171,34 @@ def train():
     kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"
 
     # 2) 학습/검증 데이터셋 생성
-    train_dataset = KITTIVideoDataset(
+    kitti_train = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=CLIP_LEN,
         resize_size=518,
         split="train"
     )
-    val_dataset = KITTIVideoDataset(
+    kitti_val = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=CLIP_LEN,
         resize_size=518,
         split="val"
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
+    train_dataset = CombinedDataset(
+        kitti_train,
+        google_image_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/images",
+        google_depth_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/depth",
+        output_size=518
+    )
+    val_dataset = CombinedDataset(
+        kitti_val,
+        google_image_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/images",
+        google_depth_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/depth",
+        output_size=518
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
 
 
     ### 3. Model and additional stuffs,...
@@ -231,6 +244,7 @@ def train():
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        scaler.load_state_dict(ckpt["scaler_state_dict"]) # mixed training
         start_epoch   = ckpt["epoch"]
         best_val_loss = ckpt["best_val_loss"]
         best_epoch    = ckpt["best_epoch"]
@@ -243,10 +257,14 @@ def train():
         model.train()
         epoch_loss = 0.0
 
-        for batch_idx, (x, y, masks) in tqdm(enumerate(train_loader)):
+        for batch_idx, (x, y, masks, x_image, y_image, mask_image) in tqdm(enumerate(train_loader)):
             x, y = x.to(device), y.to(device)
             masks = masks.bool()
             masks = masks.to(device)
+            
+            x_image    = x_image.to(device)
+            y_image    = y_image.to(device)
+            mask_image = mask_image.to(device)
             #print("x.shape",x.shape)
             #print("y.shape",y.shape)
             #print("masks.shape",masks.shape)
@@ -254,19 +272,28 @@ def train():
             #print("x:", x)  # [B, T, C, H, W]
             #print("y:", y)  # [B, T, 1, H, W]
             #print("masks:", masks)  # [B, T, 1, H, W]
+            if x_image.dim() == 4: # [B, C, H, W]Add commentMore actions
+                x_image = x_image.unsqueeze(1) # [B, T, C, H, W]
+            if y_image.dim() == 3:  # [B, H, W]
+                y_image = y_image.unsqueeze(1) # [B, T, H, W]
+            if mask_image.dim() == 3:   # [B, H, W]
+                mask_image = mask_image.unsqueeze(1)  # [B, T, H, W]
             
-            y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
+            if y.dim() == 5:
+                y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
 
             optimizer.zero_grad()
             with autocast():
                 pred = model(x)  # pred.shape == [B, T, H, W]
                 # masks.shape == [B, T, 1, H, W]
+                pred_image = model(x_image)
 
                 # 마스크 채널 축 제거
                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
                 #print("pred: ", pred)
                 #print("gt :", y)
-                print("pred.sum(): ", pred.sum().item())
+                print("video : pred.mean():", pred.mean().item())
+                print("image : pred.mean():", pred_image.mean().item())
 
                 #print("pred.isnan().any():", torch.isnan(pred).any().item())
                 #print("pred.isinf().any():", torch.isinf(pred).any().item())
@@ -276,10 +303,16 @@ def train():
                 # 유효 픽셀에만 곱하기
                 pred_masked = pred * masks_squeezed
                 y_masked    = y    * masks_squeezed
+                
+                pred_image_masked = pred_image * mask_image
+                y_image_masked    = y_image    * mask_image
 
                 loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+                loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
+                
+                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val + ratio_ssi_image * loss_ssi_val_image
+                
     #             loss = loss_ssi_val
 
                 # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
@@ -314,7 +347,8 @@ def train():
         cnt_clip = 0
 
         with torch.no_grad():
-            for batch_idx, (x, y, masks, true_depth, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
+            for batch_idx, batch in tqdm(enumerate(val_loader)):
+                x, y, masks, true_depth, extrinsics, intrinsics = batch
                 x, y,true_depth = x.to(device), y.to(device),  true_depth.to(device)
                 pred = model(x)
 #                 pred_cpu = pred.detach().cpu()  # GPU 메모리→CPU로 복사
@@ -465,6 +499,7 @@ def train():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),  # mixed training
                 'best_val_loss': best_val_loss,
                 'best_epoch': best_epoch,
                 'trial': trial,
@@ -480,6 +515,7 @@ def train():
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(), # mixed training
             'best_val_loss': best_val_loss,
             'best_epoch': best_epoch,
             'trial': trial,
