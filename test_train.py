@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from utils.loss_MiDas import Loss_ssi, Loss_tgm
+from utils.loss_MiDas import *
 #from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
 #from data.VKITTI import KITTIVideoDataset
 from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
@@ -30,7 +30,7 @@ CLIP_LEN =16
 
 def least_sqaure_whole_clip(infs,gts):
     
-    # 1) 채널 차원(1)을 없애고 [B,T,H,W] 로 만들기
+    # 채널 없애고 [B,T,H,W] 로 만들기
     if infs.dim() == 5 and infs.shape[2] == 1:
         infs = infs.squeeze(2)
     if gts.dim() == 5 and gts.shape[2] == 1:
@@ -59,7 +59,7 @@ def least_sqaure_whole_clip(infs,gts):
     scale = X[0].item()
     shift = X[1].item()
     aligned_pred = scale * infs + shift
-    aligned_pred = torch.clamp(aligned_pred, min=1e-3) 
+    aligned_pred = torch.clamp(aligned_pred, min=1e-3)  ## 근데 왜 1/80 아니고 .,,,???
     #aligned_pred = aligned_pred[valid_mask].view(-1, 1).double()  # [N, 1] 꼴로 맞추기
     
     #print("scale : ",scale)
@@ -184,7 +184,7 @@ def train(args):
 
     hyper_params = config["hyper_parameter"]
     
-    run = wandb.init(project="Temporal_Diff_Flow_new", entity="Depth-Finder", config=hyper_params)
+    run = wandb.init(project="Temporal_Diff_Flow_new_thresholdRatio", entity="Depth-Finder", config=hyper_params)
 
     lr = hyper_params["learning_rate"]
     #ratio_ssi = hyper_params["ratio_ssi"]
@@ -199,6 +199,7 @@ def train(args):
     ratio_ssi       = args.ratio_ssi
     ratio_tgm       = args.ratio_tgm
     ratio_ssi_image = args.ratio_ssi_image
+    threshold = args.static_th
     exp_name        = args.exp_name
     
 
@@ -253,8 +254,8 @@ def train(args):
 
     train_dataset = CombinedDataset(kitti_train,google_train,ratio=32)   
                     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=6)
+    val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=6)
 
     ### 3. Model and additional stuffs,...
 
@@ -278,7 +279,7 @@ def train(args):
     total_params = sum(p.numel() for p in model.parameters())
     print("Total parameters:", total_params)
 
-    loss_tgm = Loss_tgm()
+    loss_tgm = LossTGMVector(static_th=threshold)
     loss_ssi = Loss_ssi()
 
     wandb.watch(model, log="all")
@@ -323,6 +324,7 @@ def train(args):
                 #masks_squeezed = video_masks.squeeze(2)  # [B, T, H, W]
                 #print("pred: ", pred)
                 #print("gt :", y)
+                print("")
                 print("video : pred.mean():", pred.mean().item())
                 #print("image : pred.mean():", pred_image.mean().item())
                 #print("valid_mask.sum():", masks_squeezed.sum().item())
@@ -350,7 +352,13 @@ def train(args):
                 video_masks_squeezed = video_masks.squeeze(2)
                 loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)   ## 어차피 5->4 는 loss에서 해줌 
                 
-                infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)
+                
+                #disp_normed = norm_ssi(y,video_masks)
+                infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)    # 이렇게 나온 결과는 depth임 
+                
+                #print("pred: ", pred[0][0])
+                #print("infs_fit: ", infs_fit[0][0])
+                #print("y: ", y[0][0])
                 loss_tgm_value = loss_tgm(infs_fit, y, video_masks_squeezed)
                 
                 # =============== single img =================== # 
@@ -358,6 +366,10 @@ def train(args):
                 img_masks_squeezed = img_masks.squeeze(2)
                 loss_ssi_image_value = loss_ssi(pred_image, img_disp_normed, img_masks_squeezed)
                 
+                #if epoch < 5 : 
+                #    loss = ratio_ssi * loss_ssi_value + ratio_ssi_image * loss_ssi_image_value
+                
+                #else :
                 loss = ratio_tgm * loss_tgm_value + ratio_ssi * loss_ssi_value + ratio_ssi_image * loss_ssi_image_value
                 #print(">> loss.shape:", loss.shape)
                 #print("check ",loss_tgm_value,loss_ssi_value,loss_ssi_image_value)
@@ -409,6 +421,11 @@ def train(args):
                 ssi_loss_value = loss_ssi(pred, disp_normed, masks)
                 
                 infs_fit,_ = least_sqaure_whole_clip(infs=pred, gts=y)
+                #infs_fit = 1 / (pred + 1e-6)
+                
+                #print("infs: ", infs_fit[0][0])
+                #print("y: ", y[0][0])
+                
                 tgm_loss_value = loss_tgm(infs_fit, y, masks)
 
                 loss = ratio_ssi * ssi_loss_value + ratio_tgm * tgm_loss_value
@@ -421,7 +438,7 @@ def train(args):
                 
                 with torch.no_grad():
                     B, T, C, H, W = x.shape
-                    save_dir = f"outputs/test_train/{exp_name}/frames/test/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/check_BW/{exp_name}/frames/test/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
 
                     #with autocast():
@@ -430,7 +447,7 @@ def train(args):
                     rgb_clip   = x[0]  # [T, 3, H, W]
                     disp_clip  = disp_normed[0]       # [T, 1, H, W]
                     mask_clip  = masks[0]      # [T, 1, H, W]
-                    pred_clip  = pred[0]       # [T, 1, H, W]
+                    pred_clip  = infs_fit[0]       # [T, 1, H, W]
                     
                     for t in range(T):
                         # --- a) RGB 저장 ---
@@ -502,8 +519,6 @@ def train(args):
                     total_tae += tae
                     cnt_clip += 1   ## 이름 이슈인데, cnt_clip는 배치 내 프레임의 개수로 사용
                     
-                
-                    
             avg_val_loss = val_loss / len(val_loader)
         
             avg_absrel = total_absrel / cnt_clip
@@ -560,13 +575,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     experiments = [
-        {"ratio_ssi": 1.0, "ratio_tgm": 0.0,  "ratio_ssi_image": 0.0},
-        {"ratio_ssi": 1.0, "ratio_tgm": 10.0, "ratio_ssi_image": 0.0},
-        {"ratio_ssi": 1.0, "ratio_tgm": 10.0, "ratio_ssi_image": 0.5},
+        {"ratio_ssi": 1.0, "static_th" : 0.00005, "ratio_tgm": 0.0, "ratio_ssi_image": 0.5},
+        #{"ratio_ssi": 1.0, "static_th" : 0.003, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
+        #{"ratio_ssi": 1.0, "static_th" : 0.005, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
+        #{"ratio_ssi": 1.0, "static_th" : 0.007, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
+        #{"ratio_ssi": 1.0, "static_th" : 0.01, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
+        #{"ratio_ssi": 1.0, "static_th" : 0.02, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
     ]
 
     for exp in experiments:
-        for trial in range(3):  # 각 실험마다 3회 반복
+        for trial in range(5):  # 각 실험마다 3회 반복
             # argparse 로 받은 기본 args 복사
             run_args = argparse.Namespace(**vars(args))
 
@@ -575,11 +593,13 @@ if __name__ == "__main__":
             run_args.ratio_tgm       = exp["ratio_tgm"]
             run_args.ratio_ssi_image = exp["ratio_ssi_image"]
             run_args.trial           = trial
+            run_args.static_th = exp["static_th"]
 
             # exp_name에 trial 번호 포함
             run_args.exp_name = (
                 f"ssi{run_args.ratio_ssi}"
                 f"_tgm{run_args.ratio_tgm}"
+                f"_staticTH_{run_args.static_th}"
                 f"_ssiimg{run_args.ratio_ssi_image}"
                 f"_trial{trial}"
             )
