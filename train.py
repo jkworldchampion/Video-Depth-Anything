@@ -7,6 +7,7 @@ import numpy as np
 import yaml
 import wandb
 import gc
+import time
 
 from torch.utils.data import DataLoader 
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -19,6 +20,8 @@ from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
 from benchmark.eval.eval_tae import tae_torch
 from benchmark.eval.eval import depth2disparity
+from utils.util import *
+
 from PIL import Image
 
 matplotlib.use('Agg')
@@ -29,153 +32,12 @@ MAX_DEPTH=80.0
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 MEAN = torch.tensor((0.485,0.456,0.406), device=DEVICE).view(3,1,1)
 STD  = torch.tensor((0.229,0.224,0.225), device=DEVICE).view(3,1,1)
+# KITTI 용
 MIN_DISP = 1.0/80.0
 MAX_DISP = 1.0/0.001
 
-def metric_val(infs, gts, poses, Ks):
-
-    """
-    least square 때문에, i & i+1 계산보다는 클립 하나를 통째로 계산하는 것이 올바름 
-    infs,gts : [clip_len, ~] 꼴을 기대, inf는 
-
-    지금 문제 : gt가 여기서는 진짜 gt를 기대하고있음 clipping 하기 전 ..
-    
-    LiheYoung씨가 rel-model인 경우에는 relative depth로 metric 해도 된다고 했음 
-    -> 일단 gt말고 disparity랑 least square 때리기
-
-    """
-    
-    ### 1. preprocessing
-    #valid_mask = np.logical_and((gts>1e-3), (gts<MAX_DEPTH))
-    valid_mask = (gts > 1e-3) & (gts < MAX_DEPTH)
-    
-    gt_disp_masked = 1. / (gts[valid_mask].reshape((-1,1)).double() + 1e-8)
-    infs = infs.clamp(min=1e-3)
-    pred_disp_masked = infs[valid_mask].reshape((-1,1)).double()
-    
-    ### 2. least square
-    
-    #print("valid_mask shape ( expecting 32 x H x W ) : ",valid_mask.shape)   
-    #print("num valid pixels : ",valid_mask.sum())    ## 32개의 합이겠다. 
-    
-    #print("pred_disp_masked : ",pred_disp_masked)
-    #print("pred_disp_masked.shape : ",pred_disp_masked.shape)
-    #print("disparity_gts_disp_masked : ",disparity_gts_disp_masked)
-    #print("disparity_gts_disp_masked.shape : ",disparity_gts_disp_masked.shape)
-    
-    _ones = torch.ones_like(pred_disp_masked)
-    A = torch.cat([pred_disp_masked, _ones], dim=-1) 
-    X = torch.linalg.lstsq(A, gt_disp_masked).solution  
-    scale = X[0].item()
-    shift = X[1].item()
-    aligned_pred = scale * infs + shift
-    aligned_pred = torch.clamp(aligned_pred, min=1e-3) 
-    #aligned_pred = aligned_pred[valid_mask].view(-1, 1).double()  # [N, 1] 꼴로 맞추기
-    
-    #print("scale : ",scale)
-    #print("shift : ",shift)
-    
-    #print("aligned_pred.shape : ",aligned_pred.shape)    ## 예상대로라면, [~,1] 느낌이어야함 아 이게 아니네
-
-    depth = torch.zeros_like(aligned_pred)
-    depth = 1.0 / aligned_pred
-    
-    gt_depth = gts
-    #pred_depth = torch.clamp(depth, min=1e-3, max=MAX_DEPTH)
-    
-    pred_depth = depth
-
-    ### 4. validity
-    n = valid_mask.sum((-1, -2))    ## 인풋이 3차원이었으므로 T차원임
-    #print("n.shape: ", n.shape)
-    valid_frame = (n > 0)   # 어 이거 torch.Size([32, 518, 518]) -> 32, ? 꼴인데 지금 ?
-    #print("pred_depth.shape: ", pred_depth.shape)
-    #print("valid_frame.shape : ",valid_frame.shape)
-    pred_depth = pred_depth[valid_frame] # ok 가능함
-    gt_depth = gt_depth[valid_frame]
-    valid_mask = valid_mask[valid_frame]
-    
-    #print("valid_mask : ",valid_mask)
-    #print("valid_frame", valid_frame)
-    
-    absrel = abs_relative_difference(pred_depth, gt_depth, valid_mask)
-    delta1 = delta1_acc(pred_depth, gt_depth, valid_mask)
-    tae = eval_tae(pred_depth, gt_depth, poses, Ks, valid_mask)
-
-    
-    return absrel,delta1,tae
-
-
-def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
-    
-    error_sum = 0.
-    print("len_pred_depth : ",len(pred_depth))
-    for i in range(len(pred_depth) - 1):
-        depth1 = pred_depth[i]
-        depth2 = pred_depth[i+1]
-        
-        mask1 = masks[i]
-        mask2 = masks[i+1]
-
-        T_1 = poses[i]
-        T_2 = poses[i+1]
-
-        T_2_1 = torch.linalg.inv(T_2) @ T_1
-   
-        R_2_1 = T_2_1[:3,:3]
-        t_2_1 = T_2_1[:3, 3]
-        K = Ks[i]
-
-
-        error1 = tae_torch(depth1, depth2, R_2_1, t_2_1, K, mask2)
-        T_1_2 = torch.linalg.inv(T_2_1)
-        R_1_2 = T_1_2[:3,:3]
-        t_1_2 = T_1_2[:3, 3]
-
-
-        error2 = tae_torch(depth2, depth1, R_1_2, t_1_2, K, mask1)
-        
-        error_sum += error1
-        error_sum += error2
-    
-    result = error_sum / (2 * (len(pred_depth) -1))
-    return result
-
-# 그대로 사용
-def get_mask(depth_m, min_depth, max_depth):
-    valid_mask = (depth_m > min_depth) & (depth_m < max_depth)
-    return valid_mask.bool()
-
-# 그대로 사용
-def norm_ssi(depth, valid_mask):
-    
-    eps=1e-7
-    disparity = torch.zeros_like(depth)
-    disparity[valid_mask] = 1.0 / depth[valid_mask]
-
-    # 이거 마스크 씌우면 자동으로 펼쳐지니까 일단 내가 shape 가져가기
-    B, T, C, H, W = disparity.shape
-    disp_flat = disparity.view(B, T, -1)         # [B, T, H*W]
-    mask_flat = valid_mask.view(B, T, -1)       # [B, T, H*W]
-
-    # 마스크 빼고 민맥스 값 찾기
-    disp_min = disp_flat.masked_fill(~mask_flat, float('inf')).min(dim=-1)[0]
-    disp_max = disp_flat.masked_fill(~mask_flat, float('-inf')).max(dim=-1)[0]
-
-    disp_min = disp_min.view(B, T, 1, 1, 1)
-    disp_max = disp_max.view(B, T, 1, 1, 1)
-
-    denom = (disp_max - disp_min + eps)
-    norm_disp = (disparity - disp_min) / denom
-
-    # 걍 invalid는 0으로 만들기
-    norm_disp = norm_disp.masked_fill(~valid_mask, 0.0)
-
-    return norm_disp
-
 
 def train():
-
     ### 0. prepare GPU, wandb_login
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     api_key = os.getenv("WANDB_API_KEY")
@@ -188,7 +50,6 @@ def train():
         config = yaml.safe_load(file)
 
     hyper_params = config["hyper_parameter"]
-    
     run = wandb.init(project="Temporal_Diff_Flow", entity="Depth-Finder", config=hyper_params)
 
     lr = hyper_params["learning_rate"]
@@ -206,7 +67,6 @@ def train():
 
 
     ### 2. Load data
-
     kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"
     google_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks"
 
@@ -245,13 +105,9 @@ def train():
     )
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-                    # rgb_clip, depth_clip, x_images, y_images
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
-                    # rgb_clip, depth_clip, extrinsics, intrinsics
-
 
     ### 3. Model and additional stuffs,...
-
     model = VideoDepthAnything(num_frames=CLIP_LEN,out_channel=conv_out_channel,conv=conv).to(device)
     """
     out_channel : result of diff-conv
@@ -273,10 +129,8 @@ def train():
     total_params = sum(p.numel() for p in model.parameters())
     print("Total parameters:", total_params)
 
-#     loss_tgm = Loss_tgm()
     loss_tgm = LossTGMVector(static_th=threshold)
     loss_ssi = Loss_ssi()
-    
 
     wandb.watch(model, log="all")
 
@@ -302,8 +156,9 @@ def train():
         print(f"Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, trial={trial}")
 
     ### 4. train
-    
-    for epoch in range(start_epoch, num_epochs):
+    start_time = time.time()
+    for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
+        epoch_start = time.time()
         model.train()
         epoch_loss = 0.0
         
@@ -316,46 +171,18 @@ def train():
             x, y = x.to(device), y.to(device)
             video_masks = video_masks.to(device)
             
-            # point. image는 B랑 T랑 바꿔줘야 계산할때 연속하지 않다고 판단할 수 있을 듯 -> ㅇㅈ
+            # point. image는 B랑 T랑 바꿔줘야 계산할때 연속하지 않다고 판단할 수 있음
             x_image = x_image.permute(1,0,2,3,4).to(device)
             y_image = y_image.permute(1,0,2,3,4).to(device)
             mask_image = mask_image.permute(1,0,2,3,4).to(device).bool()
 
-            #print("x.shape",x.shape)
-            #print("y.shape",y.shape)
-            #print("masks.shape",masks.shape)
-            
-            #print("x:", x)  # [B, T, C, H, W]
-            #print("y:", y)  # [B, T, 1, H, W]
-            #print("masks:", masks)  # [B, T, 1, H, W]
-#             if x_image.dim() == 4: # [B, C, H, W]Add commentMore actions
-#                 x_image = x_image.unsqueeze(1) # [B, T, C, H, W]
-#             if y_image.dim() == 3:  # [B, H, W]
-#                 y_image = y_image.unsqueeze(1) # [B, T, H, W]
-#             if mask_image.dim() == 3:   # [B, H, W]
-#                 mask_image = mask_image.unsqueeze(1)  # [B, T, H, W]
-            
-#             if y.dim() == 5:
-#                 y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
-
             optimizer.zero_grad()
             with autocast():
                 pred = model(x)  # pred.shape == [B, T, H, W]
-                # masks.shape == [B, T, 1, H, W]
                 pred_image = model(x_image)
-
-                # 마스크 채널 축 제거
-#                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
                 
                 print("video : pred.mean():", pred.mean().item())
                 print("image : pred.mean():", pred_image.mean().item())
-
-#                 # 유효 픽셀에만 곱하기
-#                 pred_masked = pred * masks_squeezed
-#                 y_masked    = y    * masks_squeezed
-                
-#                 pred_image_masked = pred_image * mask_image
-#                 y_image_masked    = y_image    * mask_image
                 
                 # video ssi_loss
                 disp_normed = norm_ssi(y,video_masks)
@@ -370,25 +197,11 @@ def train():
                 mask_image_squeezed = mask_image.squeeze(2)
                 loss_ssi_val_image = loss_ssi(pred_image, img_disp_normed, mask_image_squeezed)
                 
-                
-#                 loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
-#                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-#                 loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
-                
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val + ratio_ssi_image * loss_ssi_val_image
-                
-    #             loss = loss_ssi_val
-
-                # 또는 스케일링 방식 사용: 유효한 픽셀 수로 정규화
-                # valid_pixel_ratio = masks.sum() / (masks.shape[0] * masks.shape[1] * masks.shape[2] * masks.shape[3] * masks.shape[4])
-                # loss = (ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val) / (valid_pixel_ratio + 1e-8)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            
-#             loss.backward()
-#             optimizer.step()
             
             epoch_loss += loss.item()
 
@@ -401,16 +214,15 @@ def train():
         print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {epoch_loss:.4f}")
         
         wandb.log({"train_loss": avg_train_loss, "epoch": epoch})
-
+        
+        # === validation loop ===
         model.eval()
         val_loss = 0.0
-
         total_absrel = 0.0
         total_delta1 = 0.0
         total_tae = 0.0
         cnt_clip = 0
         
-        # === validation loop ===
         with torch.no_grad():
             for batch_idx, (x, y, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
                 # 1) move to device
@@ -455,6 +267,7 @@ def train():
                 if batch_idx == 0:
                     save_dir = f"outputs/frames/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
+                    wb_images = []  # W&B 에 보낼 이미지 리스트
                     for t in range(T):
                         # a) RGB
                         rgb_norm = x[0, t]  # [3,H,W]
@@ -479,6 +292,9 @@ def train():
                         pred_uint8   = (pred_clamped * 255).astype(np.uint8)
                         pred_rgb_np  = np.stack([pred_uint8]*3, axis=-1)
                         Image.fromarray(pred_rgb_np).save(os.path.join(save_dir, f"pred_{t:02d}.png"))
+                        
+                        # e) pred-disparity wandb에 저장
+                        wb_images.append(wandb.Image(os.path.join(save_dir, f"pred_{t:02d}.png"), caption=f"pred_epoch{epoch}_frame{t:02d}"))
 
                     print(f"→ saved validation frames to '{save_dir}'")
 
@@ -512,8 +328,9 @@ def train():
             "absrel": avg_absrel,
             "delta1": avg_delta1,
             "tae": avg_tae,
-            "epoch": epoch
-        })
+            "epoch": epoch,
+            "pred_disparity": wb_images,
+        }, step=epoch)
         
         ### best 체크포인트 저장
         is_best = False
@@ -548,17 +365,11 @@ def train():
             'trial': trial,
         }, checkpoint_path)
 
-            #'scaler_state_dict': scaler.state_dict()   
-
-        # if trial >= patient:
-        #     print("Early stopping triggered.")
-        #     break
-    # 최종 모델 저장
+    total_time = time.time() - start_time
+    print(f"Total training time: {total_time/3600:.2f}h")
 
     print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
     run.finish()
 
 if __name__ == "__main__":
     train()
-
-
