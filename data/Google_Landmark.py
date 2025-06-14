@@ -177,10 +177,10 @@ class CombinedDataset(Dataset):
         # 리스트 → 텐서 [4, C, H, W]
         x_images = torch.stack(x_imgs)
         y_images = torch.stack(y_imgs)
-        masks4   = torch.stack(masks)
+        mask_images   = torch.stack(masks)
 
         # 3) 최종 반환
         if self.kitti.split == "train":
-            return rgb_clip, depth_clip, x_images, y_images # image는 disparity
+            return rgb_clip, depth_clip, x_images, y_images, mask_images
         else:
             return rgb_clip, depth_clip, extrinsics, intrinsics

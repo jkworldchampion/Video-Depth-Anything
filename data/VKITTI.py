@@ -46,6 +46,7 @@ class KITTIVideoDataset(Dataset):
         self.root_dir = root_dir
         self.rgb_mean = rgb_mean
         self.rgb_std = rgb_std
+        self.IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
 
         # VKITTI 폴더 구조 예시
         self.rgb_root = os.path.join(root_dir, "vkitti_2.0.3_rgb")
@@ -187,12 +188,22 @@ class KITTIVideoDataset(Dataset):
         K  = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]],dtype=np.float32)
         RT = ext[:3,:]
         return K @ RT
-
+    
+    def is_image_file(self, filename):
+        return filename.lower().endswith(self.IMG_EXTENSIONS)
     
     def __getitem__(self, idx):
         info = self.video_infos[idx]
-        rgb_files   = sorted(os.listdir(info['rgb_path']))
-        depth_files = sorted(os.listdir(info['depth_path']))
+        
+        # 폴더 명에서 .ipynb_checkpoint같은 거 없이 이미지만 잘
+        rgb_files   = sorted([
+            f for f in os.listdir(info['rgb_path'])
+            if self.is_image_file(f) and os.path.isfile(os.path.join(info['rgb_path'], f))
+        ])
+        depth_files = sorted([
+            f for f in os.listdir(info['depth_path'])
+            if self.is_image_file(f) and os.path.isfile(os.path.join(info['depth_path'], f))
+        ])
         # clip sampling
         N = len(rgb_files)
         
