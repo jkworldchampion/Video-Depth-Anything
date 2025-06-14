@@ -300,7 +300,8 @@ class LossTGMVector(nn.Module):
 
         # 4) static & valid mask
         valid_pair = mask[:,1:] & mask[:,:-1]                     # [B,T-1,H,W]
-        static     = valid_pair & (g_diff < self.static_th)       # [B,T-1,H,W]
+        depth_diff  = (gt_depth[:,1:] - gt_depth[:,:-1]).abs()    # [B,T-1,H,W]
+        static      = valid_pair & (depth_diff < self.static_th)   # [B,T-1,H,W]
 
         # 5) error map
         err = (d_diff - g_diff).abs()                             # [B,T-1,H,W]

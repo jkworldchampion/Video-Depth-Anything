@@ -330,7 +330,7 @@ def train():
             "tae": avg_tae,
             "epoch": epoch,
             "pred_disparity": wb_images,
-        }, step=epoch)
+        })
         
         ### best 체크포인트 저장
         is_best = False

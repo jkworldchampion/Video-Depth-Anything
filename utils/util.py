@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and 
 # limitations under the License. 
 import numpy as np
+import torch
+from benchmark.eval.metric import *
+from benchmark.eval.eval_tae import tae_torch
+from benchmark.eval.eval import depth2disparity
+
+
+
+
 
 def compute_scale_and_shift(prediction, target, mask, scale_only=False):
     if scale_only:
@@ -74,7 +82,7 @@ def get_interpolate_frames(frame_list_pre, frame_list_post):
     return interpolated_frames
 
 
-def metric_val(infs, gts, poses, Ks):
+def metric_val(infs, gts, poses, Ks, MAX_DEPTH=80.0):
     """
     least square 때문에, i & i+1 계산보다는 클립 하나를 통째로 계산하는 것이 올바름 
     infs,gts : [clip_len, ~] 꼴을 기대, inf는 
