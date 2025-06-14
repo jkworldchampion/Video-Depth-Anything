@@ -6,17 +6,23 @@ import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
+# val용 conter crop
+def get_center_crop_params(img, output_size):
+    w, h = img.size
+    th, tw = output_size, output_size
+    # resized한 img는 정사각형이므로 그냥 center_crop 좌표 = (0,0)
+    # 하지만 안전하게 일반식 사용
+    i = (h - th) // 2
+    j = (w - tw) // 2
+    return i, j, th, tw
 
-def get_random_crop_params(img, output_size):
-    """
-    랜덤으로 정사각형 영역을 잘라내기 위한 좌표를 반환합니다.
-    """
+def get_random_crop_params_with_rng(img, output_size, rng):
     w, h = img.size
     th, tw = output_size, output_size
     if w == tw and h == th:
         return 0, 0, th, tw
-    i = random.randint(0, h - th)
-    j = random.randint(0, w - tw)
+    i = rng.randint(0, h - th)
+    j = rng.randint(0, w - tw)
     return i, j, th, tw
 
 
@@ -26,21 +32,20 @@ class KITTIVideoDataset(Dataset):
                  clip_len=32,
                  resize_size=518,
                  split="train",
+                 seed=0,
                  rgb_mean=(0.485, 0.456, 0.406),
-                 rgb_std=(0.229, 0.224, 0.225),
-                 min_depth=0.001,
-                 max_depth=80.0):
+                 rgb_std=(0.229, 0.224, 0.225)):
         super().__init__()
         assert split in ["train", "val"], "split은 'train' 또는 'val'이어야 합니다."
 
         self.clip_len = clip_len
         self.resize_size = resize_size
         self.split = split
+        self.seed = seed
+        self.epoch = 0
         self.root_dir = root_dir
         self.rgb_mean = rgb_mean
         self.rgb_std = rgb_std
-        self.min_depth = min_depth
-        self.max_depth = max_depth
 
         # VKITTI 폴더 구조 예시
         self.rgb_root = os.path.join(root_dir, "vkitti_2.0.3_rgb")
@@ -107,47 +112,27 @@ class KITTIVideoDataset(Dataset):
 
         print(f"[{split.upper()}] 총 {len(self.video_infos)} 개의 비디오 쌍 로드됨")
         print(f"[{split.upper()}] 첫 번째 비디오 쌍 예시: RGB={self.video_infos[0]['rgb_path']}, Depth={self.video_infos[0]['depth_path']}")
+        
+    def set_epoch(self, epoch: int):
+        """
+        매 epoch 시작 시 호출하세요.
+        예) for epoch in range(num_epochs):
+                 dataset.set_epoch(epoch)
+                 for batch in loader: …
+        """
+        self.epoch = epoch
 
     def __len__(self):
         return len(self.video_infos)
 
-    def load_depth_image_with_mask(self, path):
-#         """
-#         Depth 이미지를 로드하여 disparity 이미지(PIL)와 마스크(PIL)를 반환합니다.
-#         """
-#         depth_png = Image.open(path)
-#         depth_cm = np.array(depth_png, dtype=np.uint16).astype(np.float32)
-#         depth_m = depth_cm / 100.0  # cm → m
-
-#         valid_mask = np.logical_and((depth_m > self.min_depth), (depth_m < self.max_depth))
-#         disparity = np.zeros_like(depth_m)
-#         disparity[valid_mask] = 1.0 / depth_m[valid_mask]
-
-#         # [0,1] 범위로 정규화
-#         if np.max(disparity) > np.min(disparity):
-#             disparity_norm = (disparity - np.min(disparity)) / (np.max(disparity) - np.min(disparity) + 1e-8)
-#         else:
-#             disparity_norm = disparity
-
-#         disparity_img = Image.fromarray((disparity_norm * 255.0).astype(np.uint8), mode="L")
-#         mask_img = Image.fromarray((valid_mask * 255).astype(np.uint8), mode="L")
-#         disparity_img = disparity_img.convert("RGB")  # 3채널 변환
-
-#         return disparity_img, mask_img, depth_m
-
-        # 정규화 없애보기
-        # --- depth_m (float32, meter) 구하기 ---
-        depth_cm = np.array(Image.open(path), dtype=np.uint16).astype(np.float32)
-        depth_m  = depth_cm / 100.0  # cm→m
-
-        # --- valid mask & raw disparity (1/m) ---
-        valid_mask = (depth_m > self.min_depth) & (depth_m < self.max_depth)
-        disparity  = np.zeros_like(depth_m, dtype=np.float32)
-        disparity[valid_mask] = 1.0 / depth_m[valid_mask]
-
-        # 이제 **raw** disparity 와 mask 만 리턴
-        # (정규화나 uint8 변환 NO)
-        return disparity, valid_mask, depth_m
+    def load_depth(self, path):
+        """
+        16-bit PNG -> cm -> m 변환 후, PIL "F" 모드 이미지로 반환
+        """
+        depth_png = Image.open(path)
+        depth_cm  = np.array(depth_png, dtype=np.uint16).astype(np.float32)
+        depth_m   = depth_cm / 100.0
+        return Image.fromarray(depth_m, mode="F")  # F mode가 뭘까
 
 
     @staticmethod
@@ -187,217 +172,101 @@ class KITTIVideoDataset(Dataset):
 
         return intrinsics, extrinsics
 
+    
     @staticmethod
-    def get_camera_parameters(frame, camera_id, intrinsics, extrinsics):
-        """
-        (frame, camera_id)에 해당하는 카메라 파라미터를 반환합니다.
-        """
-        intrinsic_params = intrinsics.get((frame, camera_id))
-        extrinsic_matrix = extrinsics.get((frame, camera_id))
-        return intrinsic_params, extrinsic_matrix
+    def get_camera_parameters(frame, cam_id, intrinsics, extrinsics):
+        return intrinsics.get((frame,cam_id)), extrinsics.get((frame,cam_id))
 
+    
     @staticmethod
-    def get_projection_matrix(frame, camera_id, intrinsics, extrinsics):
-        """
-        (frame, camera_id)에 해당하는 3x4 투영 행렬을 계산하여 반환합니다.
-        """
-        intrinsic_params, extrinsic_matrix = KITTIVideoDataset.get_camera_parameters(
-            frame, camera_id, intrinsics, extrinsics
-        )
-        if intrinsic_params is None or extrinsic_matrix is None:
+    def get_projection_matrix(frame, cam_id, intrinsics, extrinsics):
+        intr, ext = KITTIVideoDataset.get_camera_parameters(frame, cam_id, intrinsics, extrinsics)
+        if intr is None or ext is None:
             return None
+        fx,fy,cx,cy = intr
+        K  = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]],dtype=np.float32)
+        RT = ext[:3,:]
+        return K @ RT
 
-        fx, fy, cx, cy = intrinsic_params
-        K = np.array([[fx, 0, cx],
-                      [0, fy, cy],
-                      [0, 0, 1]])
-        RT = extrinsic_matrix[:3, :]
-        P = K @ RT  # 3x4 투영행렬
-        return P
-
-        
-    def is_image_file(self, filename):
-        return filename.lower().endswith(self.IMG_EXTENSIONS)
     
     def __getitem__(self, idx):
-        """
-        하나의 비디오 클립을 로드하여 (rgb_clip, depth_clip, masks) 또는
-        검증 시에는 (rgb_clip, depth_clip, masks, extrinsics_list, intrinsics_list)를 반환합니다.
-        """
-        video_info = self.video_infos[idx]
-        rgb_path = video_info['rgb_path']
-        depth_path = video_info['depth_path']
-        camera_idx = video_info['camera']
-        intrinsic_file = video_info['intrinsic_file']
-        extrinsic_file = video_info['extrinsic_file']
+        info = self.video_infos[idx]
+        rgb_files   = sorted(os.listdir(info['rgb_path']))
+        depth_files = sorted(os.listdir(info['depth_path']))
+        # clip sampling
+        N = len(rgb_files)
         
-        self.IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+        # 1) RNG 초기화: 매 epoch마다, 매 idx마다 다른 시드
+        if self.split == "train":
+            rng = random.Random(self.seed + idx + self.epoch)
+            start = rng.randint(0, N - self.clip_len)
+        else:  # val: deterministic
+            start = (N - self.clip_len) // 2
+        
+        # 2) crop 좌표 결정
+        first_rgb = Image.open(os.path.join(info['rgb_path'], rgb_files[start])).convert("RGB")
+        first_rgb = TF.resize(first_rgb, self.resize_size)
+        if self.split == "train":
+            ci, cj, ch, cw = get_random_crop_params_with_rng(first_rgb, self.resize_size, rng)
+        else:
+            ci, cj, ch, cw = get_center_crop_params(first_rgb, self.resize_size)
 
-        rgb_files   = sorted([
-            f for f in os.listdir(rgb_path)
-            if self.is_image_file(f) and os.path.isfile(os.path.join(rgb_path, f))
-        ])
-        depth_files = sorted([
-            f for f in os.listdir(depth_path)
-            if self.is_image_file(f) and os.path.isfile(os.path.join(depth_path, f))
-        ])
-
-        if len(rgb_files) != len(depth_files):
-            raise ValueError(f"RGB와 Depth의 개수가 일치하지 않습니다: {rgb_path}, {depth_path}")
-
-        num_frames = len(rgb_files)
-        if num_frames < self.clip_len:
-            raise ValueError(f"비디오에 {self.clip_len}프레임이 존재하지 않습니다. 실제 프레임 수: {num_frames}")
-
-        # 랜덤하게 clip_len 길이만큼 연속된 구간 선택
-        start_idx = random.randint(0, num_frames - self.clip_len)
-
-        # 첫 번째 RGB 프레임으로부터 crop 좌표 결정
-        first_rgb_path = os.path.join(rgb_path, rgb_files[start_idx])
-        first_rgb = Image.open(first_rgb_path).convert("RGB")
-        resized_first = TF.resize(first_rgb, self.resize_size)
-        crop_i, crop_j, crop_h, crop_w = get_random_crop_params(resized_first, self.resize_size)
-
-        rgb_clip = []
-        depth_clip = []
-        masks = []
-        frame_indices = []
-        true_depth_clip = []
-
-        # 카메라 파라미터 로드 (두 개의 딕셔너리 반환)
-        intrinsics_dict, extrinsics_dict = KITTIVideoDataset.load_camera_params(
-            intrinsic_file, extrinsic_file
-        )
-
-        # 카메라 파라미터를 미리 행렬 형태로 변환
-        extrinsics_matrices = []  # [clip_len, 4, 4] 형태로 저장
-        intrinsics_matrices = []  # [clip_len, 3, 3] 형태로 저장
+        rgb_seq, depth_seq = [], []
+        # 카메라 파라미터 불러오기
+        intrinsics_dict, extrinsics_dict = self.load_camera_params(info['intrinsic_file'], info['extrinsic_file'])
+        extrinsics_list, intrinsics_list = [], []
 
         for i in range(self.clip_len):
-            frame_idx = start_idx + i
-
-            # 파일명에서 숫자 부분(“depth_000123.png” 또는 “rgb_000123.jpg”)만 추출
-            depth_name = depth_files[frame_idx]
-            # "depth_000123.png" → split('_')[-1] = "000123.png" → splitext → "000123"
-            frame_num = int(os.path.splitext(depth_name.split('_')[-1])[0])
-            frame_indices.append(frame_num)
-
-            # RGB 처리
-            rgb_name = rgb_files[frame_idx]
-            rgb_img = Image.open(os.path.join(rgb_path, rgb_name)).convert("RGB")
-            rgb_resized = TF.resize(rgb_img, self.resize_size)
-            rgb_cropped = TF.crop(rgb_resized, crop_i, crop_j, crop_h, crop_w)
-            rgb_tensor = TF.to_tensor(rgb_cropped)
-            rgb_tensor = TF.normalize(rgb_tensor, mean=self.rgb_mean, std=self.rgb_std)
-            rgb_clip.append(rgb_tensor)
-
-#             # Depth + Mask 처리
-#             disparity_img, mask_img, depth_m = self.load_depth_image_with_mask(
-#                 os.path.join(depth_path, depth_name)
-#             )
-#             depth_resized = TF.resize(disparity_img, self.resize_size)
-#             depth_cropped = TF.crop(depth_resized, crop_i, crop_j, crop_h, crop_w)
-#             depth_tensor = TF.to_tensor(depth_cropped)
-
-#             mask_resized = TF.resize(mask_img, self.resize_size, interpolation=Image.NEAREST)
-#             mask_cropped = TF.crop(mask_resized, crop_i, crop_j, crop_h, crop_w)
-#             mask_tensor = torch.from_numpy(np.array(mask_cropped)).float().unsqueeze(0)
-            
-#             depth_m_img = Image.fromarray(depth_m)           # float32→PIL
-#             depth_m_resized = TF.resize(depth_m_img, self.resize_size)
-#             depth_m_cropped = TF.crop(depth_m_resized, crop_i, crop_j, crop_h, crop_w)
-            
-#             true_depth_tensor = torch.from_numpy(np.array(depth_m_cropped)).float().unsqueeze(0)  # [1, H, W]
-#             true_depth_clip.append(true_depth_tensor)  # 1채널 깊이(m)
-
-#             depth_clip.append(depth_tensor)
-#             masks.append(mask_tensor)
-
-            # Depth 처리 변경
-            # --- (1) raw disparity, mask, true depth(m) 불러오기 ---
-            disp, mask_bool, depth_m = self.load_depth_image_with_mask(
-                os.path.join(depth_path, depth_name)
-            )
-
-            # --- (2) numpy array → resize (PIL) → numpy → crop (numpy slicing) → tensor ---
-            # resize
-            disp_resized = np.array(
-                TF.resize(Image.fromarray(disp), self.resize_size),
-                dtype=np.float32
-            )                    # [resize, resize]
-            mask_resized = np.array(
-                TF.resize(
-                    Image.fromarray(mask_bool.astype(np.uint8)),
-                    self.resize_size,
-                    interpolation=Image.NEAREST
-                ),
-                dtype=np.float32
-            )
-            depthm_resized = np.array(
-                TF.resize(Image.fromarray(depth_m), self.resize_size),
-                dtype=np.float32
-            )
-
-            # crop: numpy 슬라이싱
-            di, dj, dh, dw = crop_i, crop_j, crop_h, crop_w
-            disp_crop   = disp_resized[di:di+dh, dj:dj+dw]
-            mask_crop   = mask_resized[di:di+dh, dj:dj+dw]
-            depthm_crop = depthm_resized[di:di+dh, dj:dj+dw]
-
-            # to tensor
-            depth_tensor      = torch.from_numpy(disp_crop).unsqueeze(0)   # [1, H, W]
-            mask_tensor       = torch.from_numpy(mask_crop).unsqueeze(0)   # [1, H, W]
-            true_depth_tensor = torch.from_numpy(depthm_crop).unsqueeze(0) # [1, H, W]
-
-            # 리스트에 추가
-            depth_clip.append(depth_tensor)
-            masks.append(mask_tensor)
-            true_depth_clip.append(true_depth_tensor)
-
-            # 카메라 파라미터 조회 및 행렬 변환
-            intr_params, extr_matrix = KITTIVideoDataset.get_camera_parameters(
-                frame_num, camera_idx, intrinsics_dict, extrinsics_dict
-            )
-            
-            # Extrinsic 4x4 행렬 처리
-            if extr_matrix is not None:
-                extr_tensor = torch.tensor(extr_matrix, dtype=torch.float32)  # [4, 4]
+            # ---- RGB 처리 ----
+            img = Image.open(os.path.join(info['rgb_path'], rgb_files[start+i])).convert("RGB")
+            img = TF.resize(img, self.resize_size)
+            if self.split == "train":
+                img = TF.crop(img, ci, cj, ch, cw)
             else:
-                # 기본 단위 행렬
-                extr_tensor = torch.eye(4, dtype=torch.float32)
-                print(f"경고: 프레임 {frame_num}, 카메라 {camera_idx}에 대한 extrinsic 파라미터가 없습니다.")
-            
-            extrinsics_matrices.append(extr_tensor)
-            
-            # Intrinsic 3x3 행렬 처리
-            if intr_params is not None:
-                fx, fy, cx, cy = intr_params
-                K = torch.tensor([
-                    [fx, 0.0, cx],
-                    [0.0, fy, cy],
-                    [0.0, 0.0, 1.0]
-                ], dtype=torch.float32)  # [3, 3]
+                img = TF.center_crop(img, self.resize_size)
+            t = TF.to_tensor(img)
+            rgb_seq.append(TF.normalize(t, mean=self.rgb_mean, std=self.rgb_std))
+
+            # ---- Depth 처리 ----
+            d_img = self.load_depth(os.path.join(info['depth_path'], depth_files[start+i]))
+            d_img = TF.resize(d_img, self.resize_size)
+            if self.split == "train":
+                d_img = TF.crop(d_img, ci, cj, ch, cw)
             else:
-                # 기본 카메라 내부 파라미터
+                d_img = TF.center_crop(d_img, self.resize_size)
+            depth_seq.append(TF.to_tensor(d_img))
+
+            # ---- Val일 때만 카메라 파라미터 쌓기 ----
+            if self.split == "val":
+                frame_num = int(depth_files[start+i].split('_')[-1].split('.')[0])
+                intr_p, ext_m = self.get_camera_parameters(
+                    frame_num, info['camera'], intrinsics_dict, extrinsics_dict
+                )
+
+                # extrinsic: numpy → Tensor
+                if ext_m is None:
+                    extrinsics_list.append(torch.eye(4, dtype=torch.float32))
+                else:
+                    extrinsics_list.append(torch.tensor(ext_m, dtype=torch.float32))
+
+                # intrinsic: 파라미터 → 3×3 Tensor
+                if intr_p is None:
+                    fx, fy, cx, cy = 725.0087, 725.0087, 620.5, 187.0
+                else:
+                    fx, fy, cx, cy = intr_p
                 K = torch.tensor([
-                    [725.0087, 0.0, 620.5],
-                    [0.0, 725.0087, 187.0],
-                    [0.0, 0.0, 1.0]
+                    [fx,   0.0, cx],
+                    [0.0,  fy,  cy],
+                    [0.0,  0.0, 1.0]
                 ], dtype=torch.float32)
-                print(f"경고: 프레임 {frame_num}, 카메라 {camera_idx}에 대한 intrinsic 파라미터가 없습니다.")
-            
-            intrinsics_matrices.append(K)
+                intrinsics_list.append(K)
 
-        rgb_clip_tensor = torch.stack(rgb_clip)         # [clip_len, 3, H, W]
-        depth_clip_tensor = torch.stack(depth_clip)     # [clip_len, 3, H, W]
-        masks_tensor = torch.stack(masks)               # [clip_len, 1, H, W]
-        true_depth_tensor = torch.stack(true_depth_clip)        
+        rgb_tensor   = torch.stack(rgb_seq)    # [T,3,H,W]
+        depth_tensor = torch.stack(depth_seq)  # [T,1,H,W]
 
-        if self.split == "train":
-            return rgb_clip_tensor, depth_clip_tensor, masks_tensor
+        if self.split=="train":
+            return rgb_tensor, depth_tensor
         else:
-            # 카메라 파라미터를 텐서로 변환
-            extrinsics_tensor = torch.stack(extrinsics_matrices)  # [clip_len, 4, 4]
-            intrinsics_tensor = torch.stack(intrinsics_matrices)  # [clip_len, 3, 3]
-            
-            return rgb_clip_tensor, depth_clip_tensor, masks_tensor,  true_depth_tensor, extrinsics_tensor, intrinsics_tensor
+            extrinsics_tensor = torch.stack(extrinsics_list)
+            intrinsics_tensor = torch.stack(intrinsics_list)
+            return rgb_tensor, depth_tensor, extrinsics_tensor, intrinsics_tensor

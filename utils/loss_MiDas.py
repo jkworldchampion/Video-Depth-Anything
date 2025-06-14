@@ -25,7 +25,8 @@ class Loss_ssi(nn.Module):
         # 1) 각 프레임별로 flatten: (B*N, H*W)
         flat_d    = d.view(B * N, H * W)
         flat_ref = ref.view(B * N, H * W)  # ref도 flatten
-        flat_mask = mask.view(B * N, H * W)
+#         flat_mask = mask.view(B * N, H * W)
+        flat_mask = mask.reshape(B*N, H*W)
         
         # 2) valid pixel 개수 per frame: shape = (B*N, 1)
         valid_counts = flat_mask.sum(dim=1, keepdim=True).clamp_min(1.0)  # valid 픽셀 수 (B*N, 1)
@@ -245,3 +246,101 @@ class Loss_ssi_mse(nn.Module):
         loss = loss_per_sample.mean()  # scalar
         return loss
 
+import torch
+import torch.nn as nn
+
+
+# least sqare whole clip과 logg_tgm에서 나눠서 진행하던걸 한 번에 여기서 수행하도록 함
+class LossTGMVector(nn.Module):
+    """
+    pred_disp : [B, T, H, W]  predicted disparity
+    gt_depth  : [B, T, H, W]  ground-truth depth (m)
+    mask      : [B, T, H, W]  valid mask (bool)
+    """
+    def __init__(self, static_th=0.05, trim_ratio=0.2, eps=1e-6):
+        super().__init__()
+        self.static_th  = static_th
+        self.trim_ratio = trim_ratio
+        self.eps        = eps
+
+    def forward(self, pred_disp, gt_depth, mask):
+        # remove any channel=1 dimension
+        if pred_disp.dim() == 5 and pred_disp.size(2) == 1:
+            pred_disp = pred_disp.squeeze(2)     # [B,T,H,W]
+        if gt_depth.dim() == 5 and gt_depth.size(2) == 1:
+            gt_depth = gt_depth.squeeze(2)
+        if mask.dim() == 5 and mask.size(2) == 1:
+            mask = mask.squeeze(2)
+        
+        B, T, H, W = pred_disp.shape
+        if T < 2:
+            return torch.tensor(0., device=pred_disp.device)
+
+        # 1) raw pred disparity → raw_pred_depth
+        raw_pred_depth = 1.0 / pred_disp.clamp(min=self.eps)   # [B, T, H, W]
+        gt = gt_depth                                        # [B, T, H, W]
+
+        # 2) batch-wise scale & shift via normal equations
+        # flatten to [B, P]
+        P = T * H * W
+        raw_flat = raw_pred_depth.view(B, -1)                # [B, P]
+        gt_flat  = gt.view(B, -1)                            # [B, P]
+        m_flat   = mask.view(B, -1).float()                  # [B, P]
+
+        # means
+        count    = m_flat.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B,1]
+        mean_raw = (raw_flat * m_flat).sum(dim=1, keepdim=True) / count
+        mean_gt  = (gt_flat  * m_flat).sum(dim=1, keepdim=True) / count
+
+        # centered
+        d_c = (raw_flat - mean_raw) * m_flat                  # [B, P]
+        g_c = (gt_flat  - mean_gt ) * m_flat
+
+        cov = (d_c * g_c).sum(dim=1, keepdim=True)            # [B,1]
+        var = (d_c * d_c).sum(dim=1, keepdim=True).clamp_min(self.eps)
+
+        s = cov / var                                         # [B,1]
+        t = mean_gt - s * mean_raw                            # [B,1]
+
+        # aligned_pred_depth
+        aligned_flat = raw_flat * s + t                       # [B, P]
+        aligned_pred_depth = aligned_flat.view(B, T, H, W)    # [B, T, H, W]
+
+        # 3) disparity differences
+        # pred depth diff
+        d_diff = (aligned_pred_depth[:,1:] - aligned_pred_depth[:,:-1]).abs()  # [B,T-1,H,W]
+        # gt disparity diff
+        gt_disp = 1.0 / gt.clamp(min=self.eps)
+        g_diff  = (gt_disp[:,1:] - gt_disp[:,:-1]).abs()       # [B,T-1,H,W]
+
+        # 4) static & valid mask
+        valid_pair = mask[:,1:] & mask[:,:-1]                  # [B,T-1,H,W]
+        static     = valid_pair & (g_diff < self.static_th)    # [B,T-1,H,W]
+
+        # 5) error map
+        err = (d_diff - g_diff).abs()                          # [B,T-1,H,W]
+
+        # 6) flatten frames to [N, Q] with N=B*(T-1), Q=H*W
+        N = B * (T-1)
+        Q = H * W
+        err2    = err.view(N, Q)
+        static2 = static.view(N, Q)
+
+        # mask non-static as NaN for quantile
+        err2_nan = err2.masked_fill(~static2, float('nan'))
+
+        # 7) compute threshold per frame
+        thresh = torch.nanquantile(err2_nan, 1 - self.trim_ratio, dim=1)  # [N]
+
+        # 8) keep under threshold
+        keep = static2 & (err2 <= thresh.unsqueeze(1))       # [N,Q]
+
+        # 9) trimmed MAE per frame
+        sum_err      = (err2 * keep).sum(dim=1)               # [N]
+        count_pixels = keep.sum(dim=1).clamp_min(1.0)         # [N]
+        loss_frame   = sum_err / count_pixels                 # [N]
+
+        # 10) final mean
+        loss_tgm = loss_frame.mean()
+        print("TGM Loss per batch:", loss_tgm.item())
+        return loss_tgm

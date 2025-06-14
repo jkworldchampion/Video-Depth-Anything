@@ -8,13 +8,12 @@ import yaml
 import wandb
 import gc
 
-
 from torch.utils.data import DataLoader 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from utils.loss_MiDas import Loss_ssi, Loss_tgm
-from data import KITTIVideoDataset
+from utils.loss_MiDas import Loss_ssi, LossTGMVector 
+from data.VKITTI import KITTIVideoDataset
 from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
@@ -136,6 +135,38 @@ def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
     result = error_sum / (2 * (len(pred_depth) -1))
     return result
 
+# 그대로 사용
+def get_mask(depth_m, min_depth, max_depth):
+    valid_mask = (depth_m > min_depth) & (depth_m < max_depth)
+    return valid_mask.bool()
+
+# 그대로 사용
+def norm_ssi(depth, valid_mask):
+    
+    eps=1e-7
+    disparity = torch.zeros_like(depth)
+    disparity[valid_mask] = 1.0 / depth[valid_mask]
+
+    # 이거 마스크 씌우면 자동으로 펼쳐지니까 일단 내가 shape 가져가기
+    B, T, C, H, W = disparity.shape
+    disp_flat = disparity.view(B, T, -1)         # [B, T, H*W]
+    mask_flat = valid_mask.view(B, T, -1)       # [B, T, H*W]
+
+    # 마스크 빼고 민맥스 값 찾기
+    disp_min = disp_flat.masked_fill(~mask_flat, float('inf')).min(dim=-1)[0]
+    disp_max = disp_flat.masked_fill(~mask_flat, float('-inf')).max(dim=-1)[0]
+
+    disp_min = disp_min.view(B, T, 1, 1, 1)
+    disp_max = disp_max.view(B, T, 1, 1, 1)
+
+    denom = (disp_max - disp_min + eps)
+    norm_disp = (disparity - disp_min) / denom
+
+    # 걍 invalid는 0으로 만들기
+    norm_disp = norm_disp.masked_fill(~valid_mask, 0.0)
+
+    return norm_disp
+
 
 def train():
 
@@ -164,41 +195,53 @@ def train():
     conv_out_channel = hyper_params["conv_out_channel"]
     conv = hyper_params["conv"]
     CLIP_LEN = hyper_params["clip_len"]
+    seed = hyper_params["seed"]
+    threshold = hyper_params["threshold"]
 
 
     ### 2. Load data
 
     kitti_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/KITTI"
+    google_path = "/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks"
 
     # 2) 학습/검증 데이터셋 생성
+    # -> 원래 쓰던 dataloader에서 seed 추가해서 재현 가능하게 했고, kitti의 경우 disparity가 아닌 원래 값 전달하는 식으로 변경
     kitti_train = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=CLIP_LEN,
         resize_size=518,
+        seed=seed,
         split="train"
     )
+    
     kitti_val = KITTIVideoDataset(
         root_dir=kitti_path,
         clip_len=CLIP_LEN,
         resize_size=518,
+        seed=seed,
         split="val"
     )
 
     train_dataset = CombinedDataset(
         kitti_train,
-        google_image_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/images",
-        google_depth_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/depth",
-        output_size=518
+        google_image_root=google_path + "/images",
+        google_depth_root=google_path + "/depth",
+        output_size=518,
+        seed=seed
     )
+    
     val_dataset = CombinedDataset(
         kitti_val,
-        google_image_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/images",
-        google_depth_root="/home/icons/workspace/SungChan/Video-Depth-Anything/datasets/google_landmarks/depth",
-        output_size=518
+        google_image_root=google_path + "/images",
+        google_depth_root=google_path + "/depth",
+        output_size=518,
+        seed=seed
     )
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+                    # rgb_clip, depth_clip, x_images, y_images
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=False)
+                    # rgb_clip, depth_clip, extrinsics, intrinsics
 
 
     ### 3. Model and additional stuffs,...
@@ -224,14 +267,15 @@ def train():
     total_params = sum(p.numel() for p in model.parameters())
     print("Total parameters:", total_params)
 
-    loss_tgm = Loss_tgm()
+#     loss_tgm = Loss_tgm()
+    loss_tgm = LossTGMVector(static_th=threshold)
     loss_ssi = Loss_ssi()
     
 
     wandb.watch(model, log="all")
 
     ### 4. 체크포인트 로딩(이어 학습)
-    checkpoint_path = "latest_tgm_checkpoint.pth"
+    checkpoint_path = "latest_checkpoint_tgm_good.pth"
     start_epoch     = 0
     best_val_loss   = float('inf')
     best_epoch      = 0
@@ -256,11 +300,21 @@ def train():
     for epoch in range(start_epoch, num_epochs):
         model.train()
         epoch_loss = 0.0
+        
+        # 재현성을 위한 dataloader 설정
+        train_dataset.set_epoch(epoch)
+        val_dataset.set_epoch(epoch)
 
-        for batch_idx, (x, y, masks, x_image, y_image, mask_image) in tqdm(enumerate(train_loader)):
+        for batch_idx, (x, y, x_image, y_image) in tqdm(enumerate(train_loader)):
+            video_masks = get_mask(y,min_depth=0.001,max_depth=80.0)
             x, y = x.to(device), y.to(device)
-            masks = masks.bool()
-            masks = masks.to(device)
+            video_masks = video_masks.to(device)
+            
+            # point. image는 B랑 T랑 바꿔줘야 계산할때 연속하지 않다고 판단할 수 있을 듯 -> ㅇㅈ
+            x_image = x_image.permute(1,0,2,3,4)
+            y_image = y_image.permute(1,0,2,3,4)
+            
+            mask_image = get_mask(y_image,min_depth=1/80.0, max_depth= 1000.0) # img는 disparity에 맞게 mask 설정
             
             x_image    = x_image.to(device)
             y_image    = y_image.to(device)
@@ -272,15 +326,15 @@ def train():
             #print("x:", x)  # [B, T, C, H, W]
             #print("y:", y)  # [B, T, 1, H, W]
             #print("masks:", masks)  # [B, T, 1, H, W]
-            if x_image.dim() == 4: # [B, C, H, W]Add commentMore actions
-                x_image = x_image.unsqueeze(1) # [B, T, C, H, W]
-            if y_image.dim() == 3:  # [B, H, W]
-                y_image = y_image.unsqueeze(1) # [B, T, H, W]
-            if mask_image.dim() == 3:   # [B, H, W]
-                mask_image = mask_image.unsqueeze(1)  # [B, T, H, W]
+#             if x_image.dim() == 4: # [B, C, H, W]Add commentMore actions
+#                 x_image = x_image.unsqueeze(1) # [B, T, C, H, W]
+#             if y_image.dim() == 3:  # [B, H, W]
+#                 y_image = y_image.unsqueeze(1) # [B, T, H, W]
+#             if mask_image.dim() == 3:   # [B, H, W]
+#                 mask_image = mask_image.unsqueeze(1)  # [B, T, H, W]
             
-            if y.dim() == 5:
-                y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
+#             if y.dim() == 5:
+#                 y = y[:, :, 0, :, :]  # now y.shape == [B, T, H, W]
 
             optimizer.zero_grad()
             with autocast():
@@ -289,27 +343,35 @@ def train():
                 pred_image = model(x_image)
 
                 # 마스크 채널 축 제거
-                masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
-                #print("pred: ", pred)
-                #print("gt :", y)
+#                 masks_squeezed = masks.squeeze(2)  # [B, T, H, W]
+                
                 print("video : pred.mean():", pred.mean().item())
                 print("image : pred.mean():", pred_image.mean().item())
 
-                #print("pred.isnan().any():", torch.isnan(pred).any().item())
-                #print("pred.isinf().any():", torch.isinf(pred).any().item())
-                #if pred.sum()==0:
-                #    print("pred_sum = 0, see GT : ",y[0][0])
-
-                # 유효 픽셀에만 곱하기
-                pred_masked = pred * masks_squeezed
-                y_masked    = y    * masks_squeezed
+#                 # 유효 픽셀에만 곱하기
+#                 pred_masked = pred * masks_squeezed
+#                 y_masked    = y    * masks_squeezed
                 
-                pred_image_masked = pred_image * mask_image
-                y_image_masked    = y_image    * mask_image
-
-                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
-                loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
+#                 pred_image_masked = pred_image * mask_image
+#                 y_image_masked    = y_image    * mask_image
+                
+                # video ssi_loss
+                disp_normed = norm_ssi(y,video_masks)
+                video_masks_squeezed = video_masks.squeeze(2)
+                loss_ssi_val = loss_ssi(pred, disp_normed, video_masks_squeezed)
+                
+                # tgm loss 계산
+                loss_tgm_val = loss_tgm(pred, y, video_masks)
+                
+                # image ssi_loss
+                img_disp_normed = norm_ssi(y_image,mask_image)
+                mask_image_squeezed = mask_image.squeeze(2)
+                loss_ssi_val_image = loss_ssi(pred_image, img_disp_normed, mask_image_squeezed)
+                
+                
+#                 loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
+#                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
+#                 loss_ssi_val_image = loss_ssi(pred_image_masked, y_image_masked, mask_image)
                 
                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val + ratio_ssi_image * loss_ssi_val_image
                 
@@ -348,34 +410,45 @@ def train():
 
         with torch.no_grad():
             for batch_idx, batch in tqdm(enumerate(val_loader)):
-                x, y, masks, true_depth, extrinsics, intrinsics = batch
-                x, y,true_depth = x.to(device), y.to(device),  true_depth.to(device)
-                pred = model(x)
-#                 pred_cpu = pred.detach().cpu()  # GPU 메모리→CPU로 복사
-                masks = masks.bool()
-                masks = masks.to(device)
+                x, y, extrinsics, intrinsics = batch
+                x, y = x.to(device), y.to(device)
                 
-                y = y[:, :, 0, :, :]
+                pred = model(x)
+                masks = get_mask(y, min_depth=0.001, max_depth=80.0)
+                masks = masks.to(device).bool()  
+                
+                disp_normed = norm_ssi(y, masks)
+                masks= masks.squeeze(2)
+                ssi_loss_val = loss_ssi(pred, disp_normed, masks)
+                
+                tgm_loss_val = loss_tgm(pred, y, masks)
+                
+                loss = ratio_ssi * ssi_loss_val + ratio_tgm * tgm_loss_val
+                val_loss += loss.item()
+                
+#                 y = y[:, :, 0, :, :]
 
                 ## 기억 안나서 그냥 추가 ;;...
                 ## loss 구할때는 거기서 차원 맞춰줬었는데, 여기는 직접 해주기. b len 1 h w 에서 1 제거 
 
-                if pred.dim() == 5 :
-                    pred = pred.squeeze(2)
+#                 if pred.dim() == 5 :
+#                     pred = pred.squeeze(2)
 
-                B,CLIP_LEN,_,_ = pred.shape
+#                 B,CLIP_LEN,_,_ = pred.shape
 
-                if y.dim() == 5 :
-                    y = y.squeeze(2)
+#                 if y.dim() == 5 :
+#                     y = y.squeeze(2)
 
-                if masks.dim() == 5 :
-                    masks = masks.squeeze(2).bool()
+#                 if masks.dim() == 5 :
+#                     masks = masks.squeeze(2).bool()
                     
-                if true_depth.dim() == 5:
-                    true_depth = true_depth.squeeze(2)
+#                 if true_depth.dim() == 5:
+#                     true_depth = true_depth.squeeze(2)
                     
                 #print("extrinsics :",extrinsics_list)
                 #print("intrinsics :",intrinsics_list)
+
+                B, T, H, W = pred.shape
                 
                 poses = extrinsics.to(device)
                 Ks = intrinsics.to(device)
@@ -398,13 +471,24 @@ def train():
                     rgb_clip   = x[0]  # [T, 3, H, W]
                     disp_clip  = y[0]       # [T, 1, H, W]
                     mask_clip  = masks[0]      # [T, 1, H, W]
-                    pred_clip  = pred[0]       # [T, 1, H, W]
+                    pred_clip  = pred[0]       # [T, 1, H, W]  # pred_clip  = infs_fit[0]       # [T, 1, H, W] ? 
                     
-                    for t in range(T):
-                        # --- a) RGB 저장 ---
-                        rgb_frame = rgb_clip[t]  # [3, H, W], 값 ∈ [0,1]
-                        rgb_np = (rgb_frame.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)  # [H, W, 3]
-                        rgb_pil = Image.fromarray(rgb_np)
+                    for t in range(T):                
+                        # --- a) RGB 저장 (inverse normalize 후 저장) ---
+                        rgb_norm = rgb_clip[t]   # [3, H, W], 현재 normalized
+                        # 1) 역정규화: x * std + mean
+                        mean = torch.tensor((0.485, 0.456, 0.406), device=rgb_norm.device).view(3,1,1)
+                        std  = torch.tensor((0.229, 0.224, 0.225),  device=rgb_norm.device).view(3,1,1)
+                        rgb_unc = rgb_norm * std + mean     # [3, H, W], 값 대략 [0,1] 범위로 복구
+
+                        # 2) CPU로 내리고 CHW→HWC, [0,1]→[0,255]
+                        rgb_np = (rgb_unc.clamp(0,1)
+                                        .cpu()
+                                        .permute(1,2,0)
+                                        .numpy() * 255.0).astype(np.uint8)
+
+                        # 3) PIL로 저장
+                        rgb_pil = Image.fromarray(rgb_np, mode="RGB")
                         rgb_out = os.path.join(save_dir, f"rgb_frame_{t:02d}.png")
                         rgb_pil.save(rgb_out)
 
@@ -425,14 +509,35 @@ def train():
 
                         # --- d) Prediction 저장 ---
                         # pred_clip[t] : [H, W], float16/float32 (raw 예측값, 스케일 미정)
-                        pred_frame = pred_clip[t].cpu().float().numpy()  # → np.float32, shape=[H, W]
-                        # per-frame 정규화 (min/max) → [0,1]
-                        pmin, pmax = pred_frame.min(), pred_frame.max()
-                        pred_norm = (pred_frame - pmin) / (pmax - pmin+1e-9)
-                        pred_uint8 = (pred_norm * 255.0).astype(np.uint8)  # [H, W]
-                        pred_rgb_np = np.stack([pred_uint8]*3, axis=-1)   # [H, W, 3]
-                        pred_pil = Image.fromarray(pred_rgb_np)
-                        pred_out = os.path.join(save_dir, f"pred_frame_{t:02d}.png")
+                        # --- d) Prediction 저장 (scale-shift 보정 추가) ---
+                        # 0) NumPy로 꺼내기
+                        pred_frame = pred_clip[t].cpu().float().numpy()                    # [H, W]
+                        gt_frame   = disp_clip[t].squeeze(0).cpu().float().numpy()         # [H, W]
+                        mask_arr   = mask_clip[t].squeeze(0).cpu().numpy().astype(bool)    # [H, W]
+
+                        # 1) 유효 픽셀만 추출
+                        p = pred_frame[mask_arr]  # 이제 mask_arr 은 NumPy bool array
+                        g = gt_frame[mask_arr]
+
+                        # 2) 평균 계산
+                        p_mean = p.mean()
+                        g_mean = g.mean()
+
+                        # 3) a, b 계산 (least squares)
+                        num = ((p - p_mean) * (g - g_mean)).sum()
+                        den = ((p - p_mean)**2).sum() + 1e-9
+                        a = num / den
+                        b = g_mean - a * p_mean
+
+                        # 4) 보정 적용
+                        pred_aligned = a * pred_frame + b
+
+                        # 5) [0,1] 클램프 → uint8 → RGB로 저장
+                        pred_clamped = np.clip(pred_aligned, 0.0, 1.0)
+                        pred_uint8   = (pred_clamped * 255.0).astype(np.uint8)
+                        pred_rgb_np  = np.stack([pred_uint8]*3, axis=-1)
+                        pred_pil     = Image.fromarray(pred_rgb_np)
+                        pred_out     = os.path.join(save_dir, f"pred_frame_{t:02d}.png")
                         pred_pil.save(pred_out)
 
                     print(f"  → Epoch {epoch}, Batch {batch_idx} 저장: '{save_dir}'")
@@ -441,7 +546,7 @@ def train():
                 for b in range(B):
                     inf_clip   = pred[b]         # [clip_len, H, W]
 #                     disparity_gt_clip = y[b]    # 이거 다 3차원 맞음 
-                    gt_clip    = true_depth[b]           
+                    gt_clip    = y[b].squeeze(1)          
                     mask_clip  = masks[b]      
                     poses_clip = poses[b]      
                     Ks_clip    = Ks[b]          
@@ -456,17 +561,17 @@ def train():
                     total_tae += tae
                     cnt_clip += 1   ## 이름 이슈인데, cnt_clip는 배치 내 프레임의 개수로 사용
                     
-                # 검증 시에도 동일한 마스킹 적용
-                masks_expanded = masks.expand_as(pred)
-                pred_masked = pred * masks_expanded
-                y_masked = y * masks_expanded
-                masks_squeezed = masks.squeeze(2)
+#                 # 검증 시에도 동일한 마스킹 적용
+#                 masks_expanded = masks.expand_as(pred)
+#                 pred_masked = pred * masks_expanded
+#                 y_masked = y * masks_expanded
+#                 masks_squeezed = masks.squeeze(2)
                 
-                # 손실 계산
-                loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
-                loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
-                loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
-                val_loss += loss.item()
+#                 # 손실 계산
+#                 loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
+#                 loss_ssi_val = loss_ssi(pred_masked, y_masked, masks_squeezed)
+#                 loss = ratio_tgm * loss_tgm_val + ratio_ssi * loss_ssi_val
+#                 val_loss += loss.item()
             
             avg_val_loss = val_loss / len(val_loader)
         
@@ -503,7 +608,7 @@ def train():
                 'best_val_loss': best_val_loss,
                 'best_epoch': best_epoch,
                 'trial': trial,
-            }, 'best_checkpoint_tgm.pth')
+            }, 'latest_checkpoint_tgm_good.pth')
             print(f"Best checkpoint saved at epoch {epoch+1} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:

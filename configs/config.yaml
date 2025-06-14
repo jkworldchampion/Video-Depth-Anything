@@ -9,3 +9,5 @@ hyper_parameter:
   batch_size: 2
   conv_out_channel: 64
   conv: true
+  seed: 2025
+  threshold: 0.05
