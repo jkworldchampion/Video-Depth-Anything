@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from utils.loss_MiDas import Loss_ssi, Loss_tgm
+from utils.loss_MiDas import *
 #from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
 #from data.VKITTI import KITTIVideoDataset
 from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
@@ -27,10 +27,13 @@ matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
 CLIP_LEN =16
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+MEAN = torch.tensor((0.485,0.456,0.406), device=DEVICE).view(3,1,1)
+STD  = torch.tensor((0.229,0.224,0.225), device=DEVICE).view(3,1,1)
 
 def least_sqaure_whole_clip(infs,gts):
     
-    # 1) 채널 차원(1)을 없애고 [B,T,H,W] 로 만들기
+    # 채널 없애고 [B,T,H,W] 로 만들기
     if infs.dim() == 5 and infs.shape[2] == 1:
         infs = infs.squeeze(2)
     if gts.dim() == 5 and gts.shape[2] == 1:
@@ -59,12 +62,10 @@ def least_sqaure_whole_clip(infs,gts):
     scale = X[0].item()
     shift = X[1].item()
     aligned_pred = scale * infs + shift
-    aligned_pred = torch.clamp(aligned_pred, min=1e-3) 
+    aligned_pred = torch.clamp(aligned_pred, min=1e-3)  ## 근데 왜 1/80 아니고 .,,,???
     #aligned_pred = aligned_pred[valid_mask].view(-1, 1).double()  # [N, 1] 꼴로 맞추기
-    
     #print("scale : ",scale)
     #print("shift : ",shift)
-    
     #print("aligned_pred.shape : ",aligned_pred.shape)    ## 예상대로라면, [~,1] 느낌이어야함 아 이게 아니네
 
     depth = torch.zeros_like(aligned_pred)
@@ -142,7 +143,6 @@ def get_mask(depth_m, min_depth, max_depth):
 
 
 def norm_ssi(depth, valid_mask):
-    
     eps=1e-6
     disparity = torch.zeros_like(depth)
     disparity[valid_mask] = 1.0 / depth[valid_mask]
@@ -168,7 +168,6 @@ def norm_ssi(depth, valid_mask):
     return norm_disp
     
     
-
 def train(args):
 
     ### 0. prepare GPU, wandb_login
@@ -184,7 +183,7 @@ def train(args):
 
     hyper_params = config["hyper_parameter"]
     
-    run = wandb.init(project="Temporal_Diff_Flow_new", entity="Depth-Finder", config=hyper_params)
+    run = wandb.init(project="Temporal_Diff_Flow_new_thresholdRatio", entity="Depth-Finder", config=hyper_params)
 
     lr = hyper_params["learning_rate"]
     #ratio_ssi = hyper_params["ratio_ssi"]
@@ -199,6 +198,7 @@ def train(args):
     ratio_ssi       = args.ratio_ssi
     ratio_tgm       = args.ratio_tgm
     ratio_ssi_image = args.ratio_ssi_image
+    threshold = args.static_th
     exp_name        = args.exp_name
     
 
@@ -253,8 +253,8 @@ def train(args):
 
     train_dataset = CombinedDataset(kitti_train,google_train,ratio=32)   
                     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=6)
+    val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=6)
 
     ### 3. Model and additional stuffs,...
 
@@ -278,7 +278,7 @@ def train(args):
     total_params = sum(p.numel() for p in model.parameters())
     print("Total parameters:", total_params)
 
-    loss_tgm = Loss_tgm()
+    loss_tgm = LossTGMVector(static_th=threshold)
     loss_ssi = Loss_ssi()
 
     wandb.watch(model, log="all")
@@ -323,6 +323,7 @@ def train(args):
                 #masks_squeezed = video_masks.squeeze(2)  # [B, T, H, W]
                 #print("pred: ", pred)
                 #print("gt :", y)
+                print("")
                 print("video : pred.mean():", pred.mean().item())
                 #print("image : pred.mean():", pred_image.mean().item())
                 #print("valid_mask.sum():", masks_squeezed.sum().item())
@@ -350,14 +351,24 @@ def train(args):
                 video_masks_squeezed = video_masks.squeeze(2)
                 loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)   ## 어차피 5->4 는 loss에서 해줌 
                 
-                infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)
-                loss_tgm_value = loss_tgm(infs_fit, y, video_masks_squeezed)
+                
+                #disp_normed = norm_ssi(y,video_masks)
+                #infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)    # 이렇게 나온 결과는 depth임 
+                
+                #print("pred: ", pred[0][0])
+                #print("infs_fit: ", infs_fit[0][0])
+                #print("y: ", y[0][0])
+                loss_tgm_value = loss_tgm(pred, y, video_masks_squeezed)
                 
                 # =============== single img =================== # 
                 img_disp_normed = norm_ssi(y_image,img_masks)
                 img_masks_squeezed = img_masks.squeeze(2)
                 loss_ssi_image_value = loss_ssi(pred_image, img_disp_normed, img_masks_squeezed)
                 
+                #if epoch < 5 : 
+                #    loss = ratio_ssi * loss_ssi_value + ratio_ssi_image * loss_ssi_image_value
+                
+                #else :
                 loss = ratio_tgm * loss_tgm_value + ratio_ssi * loss_ssi_value + ratio_ssi_image * loss_ssi_image_value
                 #print(">> loss.shape:", loss.shape)
                 #print("check ",loss_tgm_value,loss_ssi_value,loss_ssi_image_value)
@@ -385,131 +396,119 @@ def train(args):
         scheduler.step()
 
         print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {avg_train_loss:.4f}")        
-        
+
+        # === validation loop ===
         model.eval()
         val_loss = 0.0
-
         total_absrel = 0.0
         total_delta1 = 0.0
         total_tae = 0.0
         cnt_clip = 0
-
-        with torch.no_grad():
-            for batch_idx, batch in tqdm(enumerate(val_loader)):
-                x, y, extrinsics, intrinsics = batch
-                x, y = x.to(device), y.to(device)
-                
-                pred = model(x)
-                masks = get_mask(y, min_depth=0.001, max_depth=80.0)
-                masks = masks.to(device).bool()             # [B, T, 1, H, W]
-
-                
-                disp_normed = norm_ssi(y, masks)
-                masks= masks.squeeze(2)
-                ssi_loss_value = loss_ssi(pred, disp_normed, masks)
-                
-                infs_fit,_ = least_sqaure_whole_clip(infs=pred, gts=y)
-                tgm_loss_value = loss_tgm(infs_fit, y, masks)
-
-                loss = ratio_ssi * ssi_loss_value + ratio_tgm * tgm_loss_value
-                val_loss += loss.item()
-
-                # 8) accumulate metrics
-                B, T, H, W = pred.shape
-                poses = extrinsics.to(device)
-                Ks   = intrinsics.to(device)
-                
-                with torch.no_grad():
-                    B, T, C, H, W = x.shape
-                    save_dir = f"outputs/test_train/{exp_name}/frames/test/epoch_{epoch}_batch_{batch_idx}"
-                    os.makedirs(save_dir, exist_ok=True)
-
-                    #with autocast():
-                    pred = model(x)
-                    # 이제 B=1 가정 → B 차원 제거
-                    rgb_clip   = x[0]  # [T, 3, H, W]
-                    disp_clip  = disp_normed[0]       # [T, 1, H, W]
-                    mask_clip  = masks[0]      # [T, 1, H, W]
-                    pred_clip  = pred[0]       # [T, 1, H, W]
-                    
-                    for t in range(T):
-                        # --- a) RGB 저장 ---
-                        rgb_frame = rgb_clip[t]  # [3, H, W], 값 ∈ [0,1]
-                        rgb_np = (rgb_frame.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)  # [H, W, 3]
-                        rgb_pil = Image.fromarray(rgb_np)
-                        rgb_out = os.path.join(save_dir, f"rgb_frame_{t:02d}.png")
-                        rgb_pil.save(rgb_out)
-
-                        #disp_frame = 1.0 / (disp_clip[t, 0] + 1e-6)          # [H, W]
-                        #print(disp_frame.min().item(), disp_frame.max().item())
-                        #disp_frame = disp_frame.clamp_(max=0.05) 
-                        #d_min, d_max = disp_frame[mask_clip[t]].min(), disp_frame[mask_clip[t]].max()
-                        #disp_norm = (disp_frame - d_min) / (d_max - d_min + 1e-9)
-                        
-                        disp_np = (disp_clip[t,0].cpu().numpy() * 255.0).astype(np.uint8)  # [H, W]
-                        disp_rgb_np = np.stack([disp_np] * 3, axis=-1)                # [H, W, 3]
-                        disp_pil = Image.fromarray(disp_rgb_np)
-                        disp_out = os.path.join(save_dir, f"disp_frame_{t:02d}.png")
-                        disp_pil.save(disp_out)
-
-                        # --- c) Mask 저장 ---
-                        mask_frame = mask_clip[t]  # [1, H, W], 값 ∈ {0, 255}
-                        mask_np = (mask_frame.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)  # [H, W]
-                        mask_pil = Image.fromarray(mask_np)
-                        mask_out = os.path.join(save_dir, f"mask_frame_{t:02d}.png")
-                        mask_pil.save(mask_out)
-
-                        # --- d) Prediction 저장 ---
-                        # pred_clip[t] : [H, W], float16/float32 (raw 예측값, 스케일 미정)
-                        pred_frame = pred_clip[t].cpu().float().numpy()  # → np.float32, shape=[H, W]
-                        #pred_norm = (pred_frame - pmin) / (pmax - pmin+1e-9)
-                        pred_uint8 = (pred_frame * 255.0).astype(np.uint8)  # [H, W]
-                        pred_rgb_np = np.stack([pred_uint8]*3, axis=-1)   # [H, W, 3]
-                        pred_pil = Image.fromarray(pred_rgb_np)
-                        pred_out = os.path.join(save_dir, f"pred_frame_{t:02d}.png")
-                        pred_pil.save(pred_out)
-                        
-                        # --- e) Prediction 저장 ---
-                        # pred_clip[t] : [H, W], float16/float32 (raw 예측값, 스케일 미정)
-                        pred_frame = pred_clip[t].cpu().float().numpy()  # → np.float32, shape=[H, W]
-                        # per-frame 정규화 (min/max) → [0,1]
-                        pmin, pmax = pred_frame.min(), pred_frame.max()
-                        pred_norm = (pred_frame - pmin) / (pmax - pmin+1e-9)
-                        pred_uint8 = (pred_norm * 255.0).astype(np.uint8)  # [H, W]
-                        pred_rgb_np = np.stack([pred_uint8]*3, axis=-1)   # [H, W, 3]
-                        pred_pil = Image.fromarray(pred_rgb_np)
-                        pred_out = os.path.join(save_dir, f"pred_frame_norm_{t:02d}.png")
-                        pred_pil.save(pred_out)
-                        
-                        if t == 0 :
-                            break
-
-                    print(f"  → Epoch {epoch}, Batch {batch_idx} 저장: '{save_dir}'")
-
-                
-                for b in range(B):
-                    inf_clip   = pred[b]         # [clip_len, H, W]
-                    gt_clip    = y[b].squeeze(1)            
-                    poses_clip = poses[b]      
-                    Ks_clip    = Ks[b]          
-
-                    absrel, delta1, tae = metric_val(
-                        inf_clip, gt_clip, poses_clip, Ks_clip
-                    )
-
-                    total_absrel += absrel
-                    total_delta1 += delta1
-                    total_tae += tae
-                    cnt_clip += 1   ## 이름 이슈인데, cnt_clip는 배치 내 프레임의 개수로 사용
-                    
-                
-                    
-            avg_val_loss = val_loss / len(val_loader)
         
-            avg_absrel = total_absrel / cnt_clip
-            avg_delta1 = total_delta1 / cnt_clip
-            avg_tae = total_tae / cnt_clip
-            
+        with torch.no_grad():
+            for batch_idx, (x, y, extrinsics, intrinsics) in tqdm(enumerate(val_loader)):
+                # 1) move to device
+                x, y = x.to(device), y.to(device)
+                extrinsics, intrinsics = extrinsics.to(device), intrinsics.to(device)
+
+                # 2) model inference + basic losses
+                pred = model(x)                                        # [B, T, H, W]
+                masks = get_mask(y, min_depth=0.001, max_depth=80.0)   # [B, T, 1, H, W]
+                masks = masks.to(device).bool()
+                disp_normed   = norm_ssi(y, masks)
+                ssi_loss_val  = loss_ssi(pred, disp_normed, masks.squeeze(2))
+                tgm_loss_val  = loss_tgm(pred, y, masks)
+                val_loss     += ratio_ssi * ssi_loss_val + ratio_tgm * tgm_loss_val
+
+                print("pred.mean():", pred.mean().item())
+
+                # 3) prepare for scale & shift
+                B, T, H, W = pred.shape
+                MIN_DISP = 1.0 / 80.0      # depth=80m → disp=0.0125
+                MAX_DISP = 1.0 / 0.001     # depth=0.001m → disp=1000.0
+
+                raw_disp = pred.clamp(min=1e-6)                # [B, T, H, W]
+                gt_disp  = (1.0 / y.clamp(min=1e-6)).squeeze(2) # [B, T, H, W]
+                m_flat   = masks.squeeze(2).view(B, -1).float()# [B, P]
+                p_flat   = raw_disp.view(B, -1)               # [B, P]
+                g_flat   = gt_disp .view(B, -1)               # [B, P]
+
+                # 4) build A, b for least-squares: A @ [a; b] ≈ b_vec
+                A     = torch.stack([p_flat, torch.ones_like(p_flat, device=device)], dim=-1)  # [B,P,2]
+                A     = A * m_flat.unsqueeze(-1)                                             # mask out invalid
+                b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)                          # [B,P,1]
+
+                # 5) batched least-squares
+                X = torch.linalg.lstsq(A, b_vec).solution  # [B,2,1]
+                a = X[:,0,0].view(B,1,1,1)                 # [B,1,1,1]
+                b = X[:,1,0].view(B,1,1,1)                 # [B,1,1,1]
+
+                aligned_disp = (raw_disp * a + b).clamp(min=MIN_DISP, max=MAX_DISP)  # [B,T,H,W]
+
+                # 4) 첫 배치에만 프레임 저장
+                if batch_idx == 0:
+                    save_dir = f"outputs/frames/epoch_{epoch}_batch_{batch_idx}"
+                    os.makedirs(save_dir, exist_ok=True)
+                    wb_images = []  # W&B 에 보낼 이미지 리스트
+                    for t in range(T):
+                        # a) RGB
+                        rgb_norm = x[0, t]  # [3,H,W]
+                        rgb_unc  = (rgb_norm * STD + MEAN).clamp(0,1)
+                        rgb_np   = (rgb_unc.cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
+                        Image.fromarray(rgb_np).save(os.path.join(save_dir, f"rgb_{t:02d}.png"))
+
+                        # b) GT Disparity 저장 (Min–Max 정규화)
+                        depth_frame = y[0, t].squeeze(0).clamp(min=1e-6)       # [H,W]
+                        disp_frame  = 1.0 / depth_frame                       # [H,W]
+                        valid       = masks[0, t].squeeze(0)                  # [H,W] bool
+
+                        # 유효 픽셀만 뽑아 min/max
+                        d_vals = disp_frame[valid]
+                        d_min, d_max = d_vals.min(), d_vals.max()
+
+                        norm_gt = (disp_frame - d_min) / (d_max - d_min + 1e-6)
+                        norm_gt = norm_gt.clamp(0,1)
+
+                        gt_uint8 = (norm_gt.cpu().numpy() * 255).astype(np.uint8)
+                        gt_rgb   = np.stack([gt_uint8]*3, axis=-1)
+                        Image.fromarray(gt_rgb).save(os.path.join(save_dir, f"gt_{t:02d}.png"))
+
+                        # c) Mask 저장
+                        mask_frame = masks[0, t].squeeze(0).cpu().numpy().astype(np.uint8) * 255
+                        Image.fromarray(mask_frame).save(os.path.join(save_dir, f"mask_{t:02d}.png"))
+                        
+                        # d) Predicted Disparity 저장 (같은 Min–Max 사용)
+                        pred_frame = aligned_disp[0, t]  # [H,W]
+                        norm_pd = (pred_frame - d_min) / (d_max - d_min + 1e-6)
+                        norm_pd = norm_pd.clamp(0,1)
+
+                        pd_uint8 = (norm_pd.cpu().numpy() * 255).astype(np.uint8)
+                        pd_rgb   = np.stack([pd_uint8]*3, axis=-1)
+                        Image.fromarray(pd_rgb).save(os.path.join(save_dir, f"pred_{t:02d}.png"))
+                        
+                        # e) pred-disparity wandb에 저장
+                        wb_images.append(wandb.Image(os.path.join(save_dir, f"pred_{t:02d}.png"), caption=f"pred_epoch{epoch}_frame{t:02d}"))
+
+                    print(f"→ saved validation frames to '{save_dir}'")
+
+                # 5) metric 평가 (모든 배치에 대해)
+                for b in range(B):
+                    inf_clip  = pred[b]              # [T,H,W]
+                    gt_clip   = y[b].squeeze(1)      # [T,H,W]
+                    mask_clip = masks[b].squeeze(1)  # [T,H,W]
+                    pose      = extrinsics[b]
+                    Kmat      = intrinsics[b]
+                    absr, d1, tae = metric_val(inf_clip, gt_clip, pose, Kmat)
+                    total_absrel  += absr
+                    total_delta1  += d1
+                    total_tae     += tae
+                    cnt_clip     += 1
+
+            # 최종 통계
+            avg_val_loss = val_loss / len(val_loader)
+            avg_absrel   = total_absrel / cnt_clip
+            avg_delta1   = total_delta1 / cnt_clip
+            avg_tae      = total_tae / cnt_clip
 
         print(f"Epoch [{epoch}/{num_epochs}] Validation Loss: {avg_val_loss:.4f}")
         print(f"AbsRel  : {avg_absrel:.4f}")
@@ -522,20 +521,27 @@ def train(args):
             "absrel": avg_absrel,
             "delta1": avg_delta1,
             "tae": avg_tae,
-            "epoch": epoch
+            "epoch": epoch,
+            "pred_disparity": wb_images,
         })
         
+        ### best 체크포인트 저장
+        is_best = False
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            best_epoch = epoch
+            best_epoch = epoch+1
+            is_best = True
             torch.save({
-                'epoch': epoch,
+                'epoch': epoch+1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),    
-                'scaler_state_dict': scaler.state_dict(),
-            }, 'best_checkpoint.pth')
-            print(f"Best checkpoint saved at epoch {epoch} with validation loss {avg_val_loss:.4f}")
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),  # mixed training
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'trial': trial,
+            }, 'latest_checkpoint_tgm_good.pth')
+            print(f"Best checkpoint saved at epoch {epoch+1} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:
             trial += 1
@@ -560,13 +566,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     experiments = [
-        {"ratio_ssi": 1.0, "ratio_tgm": 0.0,  "ratio_ssi_image": 0.0},
-        {"ratio_ssi": 1.0, "ratio_tgm": 10.0, "ratio_ssi_image": 0.0},
-        {"ratio_ssi": 1.0, "ratio_tgm": 10.0, "ratio_ssi_image": 0.5},
+        {"ratio_ssi": 1.0, "static_th" : 0.00005, "ratio_tgm": 0.0, "ratio_ssi_image": 0.5},
     ]
 
     for exp in experiments:
-        for trial in range(3):  # 각 실험마다 3회 반복
+        for trial in range(5):  # 각 실험마다 3회 반복
             # argparse 로 받은 기본 args 복사
             run_args = argparse.Namespace(**vars(args))
 
@@ -575,11 +579,13 @@ if __name__ == "__main__":
             run_args.ratio_tgm       = exp["ratio_tgm"]
             run_args.ratio_ssi_image = exp["ratio_ssi_image"]
             run_args.trial           = trial
+            run_args.static_th = exp["static_th"]
 
             # exp_name에 trial 번호 포함
             run_args.exp_name = (
                 f"ssi{run_args.ratio_ssi}"
                 f"_tgm{run_args.ratio_tgm}"
+                f"_staticTH_{run_args.static_th}"
                 f"_ssiimg{run_args.ratio_ssi_image}"
                 f"_trial{trial}"
             )

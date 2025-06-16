@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 
+
 class Loss_ssi(nn.Module):
     # DA와는 다르게, 들어오는 차원이 B x N x 1 x H x W 임 !!
     # mask 차원 : [B, T, H, W]
@@ -79,6 +80,97 @@ class Loss_ssi(nn.Module):
         print("SSI Loss per batch:", loss_ssi.item())
 
         return loss_ssi
+
+
+
+class LossTGMVector(nn.Module):
+    """
+    pred_disp : [B, T, H, W]  predicted disparity
+    gt_depth  : [B, T, H, W]  ground-truth depth (m)
+    mask      : [B, T, H, W]  valid mask (bool)
+    """
+    def __init__(self, static_th=0.05, trim_ratio=0.2, eps=1e-6):
+        super().__init__()
+        self.static_th  = static_th
+        self.trim_ratio = trim_ratio
+        self.eps        = eps
+
+    def forward(self, pred_disp, gt_depth, mask):
+        # remove channel=1 dimension if present
+        if pred_disp.dim() == 5 and pred_disp.size(2) == 1:
+            pred_disp = pred_disp.squeeze(2)   # [B,T,H,W]
+        if gt_depth.dim() == 5 and gt_depth.size(2) == 1:
+            gt_depth = gt_depth.squeeze(2)
+        if mask.dim() == 5 and mask.size(2) == 1:
+            mask = mask.squeeze(2)
+        
+        B, T, H, W = pred_disp.shape
+        if T < 2:
+            return torch.tensor(0., device=pred_disp.device)
+
+        # 1) raw pred disparity & gt disparity
+        raw_pred_disp = pred_disp.clamp(min=self.eps)               # [B,T,H,W]
+        gt_disp       = 1.0 / gt_depth.clamp(min=self.eps)         # [B,T,H,W]
+
+        # 2) batch-wise scale & shift in disparity domain
+        P = T * H * W
+        raw_flat = raw_pred_disp.view(B, -1)                       # [B, P]
+        gt_flat  = gt_disp.view(B, -1)                             # [B, P]
+        m_flat   = mask.view(B, -1).float()                        # [B, P]
+
+        count    = m_flat.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B,1]
+        mean_raw = (raw_flat * m_flat).sum(dim=1, keepdim=True) / count
+        mean_gt  = (gt_flat  * m_flat).sum(dim=1, keepdim=True) / count
+
+        d_c = (raw_flat - mean_raw) * m_flat                       # [B, P]
+        g_c = (gt_flat  - mean_gt ) * m_flat
+
+        cov = (d_c * g_c).sum(dim=1, keepdim=True)                 # [B,1]
+        var = (d_c * d_c).sum(dim=1, keepdim=True).clamp_min(self.eps)
+
+        s = cov / var                                              # [B,1]
+        t = mean_gt - s * mean_raw                                 # [B,1]
+
+        aligned_flat      = raw_flat * s + t                       # [B, P]
+        aligned_pred_disp = aligned_flat.view(B, T, H, W)          # [B, T, H, W]
+
+        # 3) disparity differences
+        d_diff = (aligned_pred_disp[:,1:] - aligned_pred_disp[:,:-1]).abs()  # [B,T-1,H,W]
+        g_diff = (gt_disp[:,1:]            - gt_disp[:,:-1]).abs()           # [B,T-1,H,W]
+
+        # 4) static & valid mask
+        valid_pair = mask[:,1:] & mask[:,:-1]                     # [B,T-1,H,W]
+        depth_diff  = (gt_depth[:,1:] - gt_depth[:,:-1]).abs()    # [B,T-1,H,W]
+        static      = valid_pair & (depth_diff < self.static_th)   # [B,T-1,H,W]
+
+        # 5) error map
+        err = (d_diff - g_diff).abs()                             # [B,T-1,H,W]
+
+        # 6) flatten to [N, Q]
+        N = B * (T-1)
+        Q = H * W
+        err2    = err.view(N, Q)
+        static2 = static.view(N, Q)
+
+        # mask non-static as NaN for quantile
+        err2_nan = err2.masked_fill(~static2, float('nan'))
+
+        # 7) threshold per frame
+        thresh = torch.nanquantile(err2_nan, 1 - self.trim_ratio, dim=1)  # [N]
+
+        # 8) keep under threshold
+        keep = static2 & (err2 <= thresh.unsqueeze(1))           # [N,Q]
+
+        # 9) trimmed MAE per frame
+        sum_err      = (err2 * keep).sum(dim=1)                  # [N]
+        count_pixels = keep.sum(dim=1).clamp_min(1.0)            # [N]
+        loss_frame   = sum_err / count_pixels                    # [N]
+
+        # 10) final mean
+        loss_tgm = loss_frame.mean()
+        print("TGM Loss per batch:", loss_tgm.item())
+        return loss_tgm
+
 
 class Loss_tgm(nn.Module):
     def __init__(self):
@@ -239,54 +331,3 @@ class Loss_ssi_mse(nn.Module):
         loss = loss_per_sample.mean()  # scalar
         return loss
 
-
-
-class LossTGMVector(nn.Module):
-    """
-    pred, y    : [B, T, 1, H, W]  or  [B, T, H, W]  (depth[m])
-    mask       : [B, T, H, W]      True = valid
-    """
-    def __init__(self, static_th=0.05, eps=1e-6):
-        super().__init__()
-        self.static_th = static_th
-        self.eps = eps
-
-    def forward(self, pred, y, mask):
-        
-        #print("y shape ", y.shape)
-        # squeeze 채널 1
-
-        B, T, H, W = pred.shape
-        if T < 2:
-            return torch.tensor(0., device=pred.device)
-
-        mask = mask.bool()
-        
-        if y.dim() == 5:
-            y = y.squeeze(2)
-        
-        # 인접 프레임 depth 차이
-        d_diff = (pred[:, 1:] - pred[:, :-1]).abs()   # [B,T-1,H,W]
-        g_diff = (y   [:, 1:] - y   [:, :-1]).abs()
-
-        # 두 프레임 모두 valid
-        valid = mask[:, 1:] & mask[:, :-1]
-        
-        #print("pred shape : ", pred.shape)  # torch.Size([1, 16, 518, 518])
-        #print("y shape ", y.shape) # torch.Size([1, 16, 1, 518, 518])
-        #print("valid shape : ", valid.shape) # torch.Size([1, 15, 518, 518])
-        #print("diff shape : ", d_diff.shape) # torch.Size([1, 15, 518, 518])
-
-        static = (g_diff < self.static_th) & valid     # 0.05 미만이고 valid
-        diff_err = (d_diff - g_diff).abs() * static  # torch.Size([1, 15, 518, 518])
-        
-        
-        #print("static shape : ", static.shape) # torch.Size([1, 15, 518, 518])
-        print("# of static : ", static[0].sum())
-
-        num_static = static.sum(dim=(2, 3)).clamp_min(1)        # [B,T-1]
-        loss_pairs = diff_err.sum(dim=(2, 3)) / num_static      # [B,T-1]
-
-        loss_tgm = loss_pairs.mean()
-
-        return loss_tgm

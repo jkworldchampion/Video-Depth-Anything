@@ -6,19 +6,29 @@ import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 from glob import glob
+
+def get_random_crop_params_with_rng(img, output_size, rng):
+    w, h = img.size
+    th, tw = output_size, output_size
+    if w == tw and h == th:
+        return 0, 0, th, tw
+    i = rng.randint(0, h - th)
+    j = rng.randint(0, w - tw)
+    return i, j, th, tw
+
     
-def get_data_list(root_dir, data_name, split, clip_len=16):
+def get_data_list(root_dir, data_name, split, clip_len=16,condition_num=10):
     """
     data path랑 clip_len, 원하는 데이터 개수 or idx 개수만큼 리스트로 쌓아주는 함수
     """
     if data_name == "kitti":
         if split == "train":
-            video_info_train = get_kitti_video_path(root_dir, condition_num=1, split="train", binocular=False)
-            x_path, y_path = get_kitti_paths(video_info_train, clip_len, split)
+            video_info_train = get_kitti_video_path(root_dir, condition_num=condition_num, split="train", binocular=False)
+            x_path, y_path = get_kitti_individuals(video_info_train, clip_len, split)
         
         else :
-            video_info_val = get_kitti_video_path(root_dir, condition_num=1, split="val", binocular=False)
-            x_path, y_path, cam_ids, intrin_clips, extrin_clips = get_kitti_paths(video_info_val, clip_len, split)
+            video_info_val = get_kitti_video_path(root_dir, condition_num=condition_num, split="val", binocular=False)
+            x_path, y_path,cam_ids, intrin_clips, extrin_clips = get_kitti_individuals(video_info_val, clip_len, split)
             
     elif data_name == "google":
         if split == "train":
@@ -73,6 +83,7 @@ def get_kitti_paths(video_info, clip_len, split):
     intrin_clips = []
     extrin_clips = []
     cam_ids = []
+    end_idx = []
 
     for info in video_info:
         rgb_dir        = info['rgb_path']
@@ -93,6 +104,7 @@ def get_kitti_paths(video_info, clip_len, split):
             start = i * clip_len
             end   = start + clip_len
             if end > n:
+                end_idx.append()
                 break
 
             x_clips.append([os.path.join(rgb_dir,   f) for f in rgb_files[start:end]])
@@ -108,6 +120,54 @@ def get_kitti_paths(video_info, clip_len, split):
         return x_clips, y_clips 
     else:
         return x_clips, y_clips , cam_ids, intrin_clips, extrin_clips 
+    
+
+
+def get_kitti_individuals(video_info, clip_len, split):
+    """
+    기존  get_kitti_paths 의 문제점 : 클립단위로 넘겨주기 때문에 이걸 몇번째에서 자를 수 없음. 
+    그대신 end index를 저장해두고, clip 단위가 아닌 전체 영상을 넘겨주기
+
+    returns : 전체 영상 데이터 + scene의 끝점
+    """
+    x_clips = []
+    y_clips = []
+    intrin_clips = []
+    extrin_clips = []
+    cam_ids = []
+    end_idx = []
+
+    for info in video_info:
+        rgb_dir        = info['rgb_path']
+        depth_dir      = info['depth_path']
+        intrinsic_file = info['intrinsic_file']
+        extrinsic_file = info['extrinsic_file']
+        camera_id      = info['camera']
+
+        rgb_files   = sorted(os.listdir(rgb_dir))
+        depth_files = sorted(os.listdir(depth_dir))
+        if len(rgb_files) != len(depth_files):
+            continue
+
+        n = len(rgb_files) // clip_len # 즉 이제 n은 몫이에요
+
+        x_clips.append([os.path.join(rgb_dir,f) for f in rgb_files[:n*clip_len]])
+        y_clips.append([os.path.join(depth_dir,f) for f in depth_files[:n*clip_len]])
+        intrin_clips.append(intrinsic_file)
+        extrin_clips.append(extrinsic_file)
+        cam_ids.append(camera_id)
+        
+        if len(end_idx)==0:
+            end_idx.append(n)
+        else:
+            end_idx.append(end_idx[-1]+n)
+        
+    print("end idx:", end_idx)
+
+    if split == "train":
+        return x_clips, y_clips , end_idx
+    else:
+        return x_clips, y_clips , end_idx, cam_ids, intrin_clips, extrin_clips 
     
     
     
@@ -192,21 +252,24 @@ def get_kitti_video_path(root_dir, condition_num, split, binocular):
 class KITTIVideoDataset(Dataset):
     def __init__(
         self,
-        rgb_clips,
-        depth_clips,
+        rgb_paths,
+        depth_paths,
+        end_idx,
         cam_ids=None,
         intrin_clips=None,
         extrin_clips=None,
+        seed = 42,
         rgb_mean=(0.485, 0.456, 0.406),
         rgb_std=(0.229, 0.224, 0.225),
         resize_size=518,
         split="train",
+        clip_len=16,
     ):
         super().__init__()
         assert split in ["train", "val"]
-        assert len(rgb_clips) == len(depth_clips)
-        self.rgb_clips = rgb_clips
-        self.depth_clips = depth_clips
+        assert len(rgb_paths) == len(depth_paths)
+        self.rgb_paths = rgb_paths
+        self.depth_paths = depth_paths
         self.intrin_clips  = intrin_clips
         self.extrin_clips  = extrin_clips
         self.cam_ids = cam_ids
@@ -214,9 +277,37 @@ class KITTIVideoDataset(Dataset):
         self.rgb_std = rgb_std
         self.resize_size = resize_size
         self.split = split
+        self.seed = seed
+        self.epoch = 0
+        self.clip_len = clip_len
+        self.end_idx = end_idx
+
+        # scene별로  effective clip 계산
+        scene_clip_counts = [
+            len(scene_rgb)//clip_len - 1  # 마지막 클립은 버리기 -> 오버플로 방지
+            for scene_rgb in self.rgb_paths
+        ]
+
+        # 총 클립 개수
+        self.total_clips = sum(scene_clip_counts)
+
+        # flat idx -> scene_idx, chunk_idx
+        self.flat2scene = [0] * self.total_clips
+        self.flat2chunk = [0] * self.total_clips
+
+        ptr = 0
+        for scene_idx, n_eff in enumerate(scene_clip_counts):
+            for chunk_idx in range(n_eff):
+                self.flat2scene[ptr] = scene_idx
+                self.flat2chunk[ptr] = chunk_idx
+                ptr += 1
+        
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
     def __len__(self):
-        return len(self.rgb_clips)
+        return self.total_clips
 
     def load_depth(self, path):
         depth_png = Image.open(path)
@@ -293,57 +384,130 @@ class KITTIVideoDataset(Dataset):
     
     
     def __getitem__(self, idx):
-        rgb_paths = self.rgb_clips[idx]
-        depth_paths = self.depth_clips[idx]
+        """
+        지금 여기에 들어온 rgb_paths들은 그냥 전체 데이터를 가지고 있음  -> 이중리스트로 가지고있음 scene별로
+        end_idx로 이걸 적절히 핸들링 해야함
+        현재 받아오는 idx는 전체 영상길이 / clip_len으로 할거임 -> 아 이러면 안되는게, scene별로 나눠지는 몫 기준으로 해야함 ㅇㅇ 그치
+        무튼 일단 idx는 각 clip의 개수라고 생각해보자.
 
-        # 1) RGB/Depth 시퀀스만 처리
-        rgb_seq, depth_seq = [], []
-        for rp, dp in zip(rgb_paths, depth_paths):
-            img = Image.open(rp).convert("RGB")
-            img = TF.resize(img, self.resize_size)
-            img = TF.center_crop(img, self.resize_size)
-            img = TF.normalize(TF.to_tensor(img), mean=self.rgb_mean, std=self.rgb_std)
-            rgb_seq.append(img)
+        정리해보자면, idx는 clip idx를 넣어야함. 즉 
+        """
 
-            depth = self.load_depth(dp)
-            depth = TF.resize(depth, self.resize_size)
-            depth = TF.center_crop(depth, self.resize_size)
-            depth_seq.append(TF.to_tensor(depth))
+        ## algorithm : 결국 start index만 잘 뽑으면 해결되는 문제임
+        ## 주의해야할 점은, 위에서 넘겨줄때 16으로 나눠 떨어지는거만 준게 아님.-> 이러면 문제가, 나머지가 각각 다르니까 그냥 clip len만큼으로 자르자. 수정했음
+        ## shift는 0부터 15까지 가능.
+        ## 64개 였다면, -> 이걸 나누기 16 하면 4개가 나오는데
+        """
+        remaining = idx ## 예를 들어 idx가 5이다. 즉 5번째 클립을 받는 타이밍이라고 해보자
+        for scene_idx, scene_rgb in enumerate(self.rgb_paths):
+            n_clips = len(scene_rgb)// self.clip_len    # 만약 1번째 씬이 64개라고 해보면, nclip = 4
+            effective = n_clips - 1 # 마지막꺼 버림 이슈 for overflow 방지
+            if remaining < effective:
+                break
+            remaining -= effective    # remaining = 2
+        chunk_idx = remaining   # for문을 나오고 나면, chunk idx는 scene_idx에 해당하는 씬의 몇번째 클립인지가 됨
 
-        rgb_tensor = torch.stack(rgb_seq)     # [clip_len, 3, H, W]
-        depth_tensor = torch.stack(depth_seq) # [clip_len, 1, H, W]
+        -> 이거 오버헤드 너무큼 생각해보면. 위로 올리기
+        """
 
-        # 2) train split이면 여기서 바로 반환
+                # 2) train split이면 여기서 바로 반환
         if self.split == "train":
+
+            scene_idx = self.flat2scene[idx]
+            chunk_idx = self.flat2chunk[idx]
+
+            scene_rgb_paths   = self.rgb_paths[scene_idx]
+            scene_depth_paths = self.depth_paths[scene_idx]
+
+            rng = random.Random(self.seed + self.epoch)
+            shift = rng.randint(0, self.clip_len-1)
+
+            base = shift + chunk_idx * self.clip_len
+            rgb_paths  = scene_rgb_paths[base:base+self.clip_len]
+            depth_paths= scene_depth_paths[base:base+self.clip_len]
+
+            #rgb_paths = self.rgb_clips[idx]
+            #depth_paths = self.depth_clips[idx]
+
+            first = Image.open(rgb_paths[0]).convert("RGB")
+            first = TF.resize(first, self.resize_size)
+            i, j, th, tw = get_random_crop_params_with_rng(first, self.resize_size, rng)
+            
+            rgb_seq, depth_seq = [], []
+            for rp, dp in zip(rgb_paths, depth_paths):
+                img = Image.open(rp).convert("RGB")
+                img = TF.resize(img, self.resize_size)
+                img = TF.crop(img, i, j, th, tw)
+                img = TF.normalize(TF.to_tensor(img), mean=self.rgb_mean, std=self.rgb_std)
+                rgb_seq.append(img)
+
+                depth = self.load_depth(dp)
+                depth = TF.resize(depth, self.resize_size)
+                depth = TF.crop(depth, i, j, th, tw)
+                depth_seq.append(TF.to_tensor(depth))
+
+            rgb_tensor = torch.stack(rgb_seq)     # [clip_len, 3, H, W]
+            depth_tensor = torch.stack(depth_seq) # [clip_len, 1, H, W]
+
             return rgb_tensor, depth_tensor
 
-        # 3) val split일 때만 카메라 파라미터 로딩
-        camera_id = self.cam_ids[idx] if self.cam_ids is not None else 0
-        intrinsic_file = self.intrin_clips[idx]
-        extrinsic_file = self.extrin_clips[idx]
-        intrinsics_dict, extrinsics_dict = self.load_camera_params(intrinsic_file, extrinsic_file)
 
-        extrinsics_list, intrinsics_list = [], []
-        for dp in depth_paths:
-            frame_num = int(os.path.splitext(os.path.basename(dp))[0].split('_')[-1])
-            intr_p, extr_m = self.get_camera_parameters(frame_num, camera_id, intrinsics_dict, extrinsics_dict)
+        else :
 
-            if extr_m is None:
-                extr_m = np.eye(4, dtype=np.float32)
-            extrinsics_list.append(torch.tensor(extr_m, dtype=torch.float32))
+            scene_idx = self.flat2scene[idx]
+            chunk_idx = self.flat2chunk[idx]
+            
+            scene_rgb_paths   = self.rgb_paths[scene_idx]
+            scene_depth_paths = self.depth_paths[scene_idx]
 
-            if intr_p is None:
-                fx, fy, cx, cy = 725.0087, 725.0087, 620.5, 187.0
-            else:
-                fx, fy, cx, cy = intr_p
-            K = torch.tensor([[fx, 0.0, cx],
-                            [0.0, fy, cy],
-                            [0.0, 0.0, 1.0]], dtype=torch.float32)
-            intrinsics_list.append(K)
+            base = chunk_idx * self.clip_len
+            rgb_paths  = scene_rgb_paths  [base:base+self.clip_len]
+            depth_paths= scene_depth_paths[base:base+self.clip_len]
 
-        extrinsics_tensor = torch.stack(extrinsics_list)   # [clip_len, 4, 4]
-        intrinsics_tensor = torch.stack(intrinsics_list)   # [clip_len, 3, 3]
-        return rgb_tensor, depth_tensor, extrinsics_tensor, intrinsics_tensor
+            rgb_seq, depth_seq = [], []
+            for rp, dp in zip(rgb_paths, depth_paths):
+                img = Image.open(rp).convert("RGB")
+                img = TF.resize(img, self.resize_size)
+                img = TF.center_crop(img, self.resize_size)
+                img = TF.normalize(TF.to_tensor(img), mean=self.rgb_mean, std=self.rgb_std)
+                rgb_seq.append(img)
+
+                depth = self.load_depth(dp)
+                depth = TF.resize(depth, self.resize_size)
+                depth = TF.center_crop(depth, self.resize_size)
+                depth_seq.append(TF.to_tensor(depth))
+
+            rgb_tensor = torch.stack(rgb_seq)     # [clip_len, 3, H, W]
+            depth_tensor = torch.stack(depth_seq) # [clip_len, 1, H, W]
+
+            
+            # 3) val split일 때만 카메라 파라미터 로딩
+            camera_id = self.cam_ids[scene_idx]
+            intrinsic_file = self.intrin_clips[scene_idx]
+            extrinsic_file = self.extrin_clips[scene_idx]
+            intrinsics_dict, extrinsics_dict = self.load_camera_params(intrinsic_file, extrinsic_file)
+
+            extrinsics_list, intrinsics_list = [], []
+            for dp in depth_paths:
+                frame_num = int(os.path.splitext(os.path.basename(dp))[0].split('_')[-1])
+                intr_p, extr_m = self.get_camera_parameters(frame_num, camera_id, intrinsics_dict, extrinsics_dict)
+
+                if extr_m is None:
+                    extr_m = np.eye(4, dtype=np.float32)
+                extrinsics_list.append(torch.tensor(extr_m, dtype=torch.float32))
+
+                if intr_p is None:
+                    fx, fy, cx, cy = 725.0087, 725.0087, 620.5, 187.0
+                else:
+                    fx, fy, cx, cy = intr_p
+                K = torch.tensor([[fx, 0.0, cx],
+                                [0.0, fy, cy],
+                                [0.0, 0.0, 1.0]], dtype=torch.float32)
+                intrinsics_list.append(K)
+
+            extrinsics_tensor = torch.stack(extrinsics_list)   # [clip_len, 4, 4]
+            intrinsics_tensor = torch.stack(intrinsics_list)   # [clip_len, 3, 3]
+            return rgb_tensor, depth_tensor, extrinsics_tensor, intrinsics_tensor
 
 class GoogleDepthDataset(Dataset):
     def __init__(
@@ -352,7 +516,8 @@ class GoogleDepthDataset(Dataset):
         depth_paths,
         rgb_mean=(0.485, 0.456, 0.406),
         rgb_std=(0.229, 0.224, 0.225),
-        resize_size=518
+        resize_size=518,
+        seed=42
     ):
         super().__init__()
         assert len(img_paths) == len(depth_paths), "이미지/뎁스 개수 불일치"
@@ -361,15 +526,24 @@ class GoogleDepthDataset(Dataset):
         self.resize_size = resize_size
         self.rgb_mean = rgb_mean
         self.rgb_std = rgb_std
+        self.seed = seed
+        self.epoch = 0
 
     def __len__(self):
         return len(self.img_paths)
 
     def __getitem__(self, idx):
+
+        rng = random.Random(self.seed + self.epoch)
         # RGB 이미지 
+
+        first = Image.open(self.img_paths[0]).convert("RGB")
+        first = TF.resize(first, self.resize_size)
+        i, j, th, tw = get_random_crop_params_with_rng(first, self.resize_size, rng)
+
         img = Image.open(self.img_paths[idx]).convert("RGB")
         img = TF.resize(img, self.resize_size)
-        img = TF.center_crop(img, self.resize_size)
+        img = TF.crop(img, i, j, th, tw)
         img = TF.normalize(TF.to_tensor(img),mean=self.rgb_mean,std=self.rgb_std)
 
         # Disparity/Depth
@@ -380,13 +554,13 @@ class GoogleDepthDataset(Dataset):
         else:
             disp_img = Image.open(dp).convert("F")
         disp_img = TF.resize(disp_img, self.resize_size)
-        disp_img = TF.center_crop(disp_img, self.resize_size)
+        disp_img = TF.crop(disp_img, i, j, th, tw)
         disp = torch.from_numpy(np.array(disp_img, np.float32)).unsqueeze(0)
 
         return img,disp
 
 class CombinedDataset(Dataset):
-    def __init__(self, kitti_dataset, google_dataset,ratio=32):
+    def __init__(self, kitti_dataset, google_dataset,ratio=4):
         super().__init__()
         self.ratio = ratio
         self.kitti_dataset = kitti_dataset
@@ -394,10 +568,13 @@ class CombinedDataset(Dataset):
         
         #print("kitti len ",len(self.kitti_dataset))
         #print("google len ",len(self.google_dataset) )
+
+    def set_epoch(self, epoch):
+        self.kitti_dataset.set_epoch(epoch)
         
     def __len__(self):
         ## 이거 비율 1:4로 주고싶어서 
-        return min(len(self.kitti_dataset), len(self.google_dataset)//self.ratio)
+        return min(len(self.kitti_dataset), len(self.google_dataset)// self.ratio)
     
     def __getitem__(self, idx):
         kitti_item = self.kitti_dataset[idx]
@@ -409,8 +586,6 @@ class CombinedDataset(Dataset):
 
         return kitti_item, (google_imgs,google_depths)
         
-"""
-
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -461,12 +636,13 @@ google_train = GoogleDepthDataset(
     resize_size=518
 )
 
-train_dataset = CombinedDataset(kitti_train,google_train,ratio=32)   
+train_dataset = CombinedDataset(kitti_train,google_train,ratio=4)   
                 
 train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
 val_loader   = DataLoader(kitti_val,   batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
 
 
+"""
 # --- 1) 데이터셋 길이 확인 ---
 print(">> Dataset lengths:")
 print("Kitti train     :", len(kitti_train))
@@ -498,5 +674,53 @@ print("Val Depth      :", depth_v.shape) # [1, clip_len, 1, H, W]
 print("Val Extrinsics :", extr_v.shape)  # [1, clip_len, 4, 4]
 print("Val Intrinsics :", intr_v.shape)  # [1, clip_len, 3, 3]
 
-
 """
+
+
+import os
+from PIL import Image
+import torch
+
+def dump_dataloader(loader, out_root, num_epochs=2):
+    """
+    loader: DataLoader yielding (rgb_tensor, depth_tensor) for train,
+            or (rgb, depth, extr, intr) for val.
+    out_root: e.g. "/workspace/outputs/dump"
+    num_epochs: 몇 epoch 저장할지
+    """
+    os.makedirs(out_root, exist_ok=True)
+
+    for epoch in range(num_epochs):
+        for batch_idx, batch in enumerate(loader):
+            # train이면 2-tuple, val이면 4-tuple
+            rgb, depth = batch[0], batch[1]
+            # 배치 차원 제거 (여기선 batch_size=1 가정)
+            # rgb: [B, T, 3, H, W], depth: [B, T, 1, H, W]
+            B, T, C, H, W = rgb.shape
+            rgb = rgb[0]    # [T,3,H,W]
+            depth = depth[0]# [T,1,H,W]
+
+            # 저장 디렉터리
+            save_dir = os.path.join(out_root, f"epoch_{epoch}", f"batch_{batch_idx}")
+            os.makedirs(save_dir, exist_ok=True)
+
+            for t in range(T):
+                # RGB frame
+                rgb_frame = (rgb[t].permute(1,2,0).cpu().numpy() * 255).astype("uint8")
+                Image.fromarray(rgb_frame).save(os.path.join(save_dir, f"rgb_{t:02d}.png"))
+
+                # Depth frame (한 채널)
+                d = depth[t,0].cpu().numpy()
+                # 정규화해서 0-255 사이 uint8 로 저장
+                d_min, d_max = d.min(), d.max()
+                d_img = ((d - d_min) / (d_max - d_min + 1e-8) * 255).astype("uint8")
+                Image.fromarray(d_img).save(os.path.join(save_dir, f"depth_{t:02d}.png"))
+
+            # (원하면 camera 파라미터나 구글 데이터도 여기에 추가 저장 가능)
+            print(f"Saved epoch {epoch} batch {batch_idx} to {save_dir}")
+
+# 사용 예:
+out_folder = "./output/dump"
+
+
+dump_dataloader(train_loader, out_folder, num_epochs=2)
