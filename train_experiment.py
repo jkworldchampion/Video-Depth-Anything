@@ -212,7 +212,7 @@ def train(args):
         filename = "basic_model.pth"
 
     
-    run = wandb.init(project="Temporal_Diff_Flow_", entity="Depth-Finder", config=hyper_params)
+    run = wandb.init(project="Temporal_Diff_Flow_experiment", entity="Depth-Finder", config=hyper_params)
     
     ### 2. Load data
 
@@ -464,7 +464,7 @@ def train(args):
 
                 # 4) 첫 배치에만 프레임 저장
                 if batch_idx == 0:
-                    save_dir = f"outputs/frames/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/diff_{diff}_conv_{conv}_ch_{conv_out_channel}/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
                     wb_images = []  # W&B 에 보낼 이미지 리스트
                     for t in range(T):
@@ -585,3 +585,4 @@ if __name__ == "__main__":
     parser.add_argument("--conv_out_channel", type=int, default=0)
     
     args = parser.parse_args()
+    train(args)

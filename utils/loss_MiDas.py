@@ -91,7 +91,7 @@ class Loss_ssi(nn.Module):
         # 1) 각 프레임별로 flatten: (B*N, H*W)
         flat_d    = d.view(B * N, H * W)
         flat_ref = ref.view(B * N, H * W)  # ref도 flatten
-        flat_mask = mask.view(B * N, H * W)
+        flat_mask = mask.contiguous().view(B * N, H * W)
         
         # 2) valid pixel 개수 per frame: shape = (B*N, 1)
         valid_counts = flat_mask.sum(dim=1, keepdim=True).clamp_min(1.0)  # valid 픽셀 수 (B*N, 1)
