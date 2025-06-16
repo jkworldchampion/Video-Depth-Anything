@@ -239,3 +239,54 @@ class Loss_ssi_mse(nn.Module):
         loss = loss_per_sample.mean()  # scalar
         return loss
 
+
+
+class LossTGMVector(nn.Module):
+    """
+    pred, y    : [B, T, 1, H, W]  or  [B, T, H, W]  (depth[m])
+    mask       : [B, T, H, W]      True = valid
+    """
+    def __init__(self, static_th=0.05, eps=1e-6):
+        super().__init__()
+        self.static_th = static_th
+        self.eps = eps
+
+    def forward(self, pred, y, mask):
+        
+        #print("y shape ", y.shape)
+        # squeeze 채널 1
+
+        B, T, H, W = pred.shape
+        if T < 2:
+            return torch.tensor(0., device=pred.device)
+
+        mask = mask.bool()
+        
+        if y.dim() == 5:
+            y = y.squeeze(2)
+        
+        # 인접 프레임 depth 차이
+        d_diff = (pred[:, 1:] - pred[:, :-1]).abs()   # [B,T-1,H,W]
+        g_diff = (y   [:, 1:] - y   [:, :-1]).abs()
+
+        # 두 프레임 모두 valid
+        valid = mask[:, 1:] & mask[:, :-1]
+        
+        #print("pred shape : ", pred.shape)  # torch.Size([1, 16, 518, 518])
+        #print("y shape ", y.shape) # torch.Size([1, 16, 1, 518, 518])
+        #print("valid shape : ", valid.shape) # torch.Size([1, 15, 518, 518])
+        #print("diff shape : ", d_diff.shape) # torch.Size([1, 15, 518, 518])
+
+        static = (g_diff < self.static_th) & valid     # 0.05 미만이고 valid
+        diff_err = (d_diff - g_diff).abs() * static  # torch.Size([1, 15, 518, 518])
+        
+        
+        #print("static shape : ", static.shape) # torch.Size([1, 15, 518, 518])
+        print("# of static : ", static[0].sum())
+
+        num_static = static.sum(dim=(2, 3)).clamp_min(1)        # [B,T-1]
+        loss_pairs = diff_err.sum(dim=(2, 3)) / num_static      # [B,T-1]
+
+        loss_tgm = loss_pairs.mean()
+
+        return loss_tgm
