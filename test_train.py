@@ -74,6 +74,8 @@ def least_sqaure_whole_clip(infs,gts):
     
     return pred_depth, valid_mask
 
+
+
 def metric_val(infs, gts, poses, Ks):
     
     gt_depth = gts
@@ -184,7 +186,7 @@ def train(args):
 
     hyper_params = config["hyper_parameter"]
     
-    run = wandb.init(project="Temporal_Diff_Flow_new_thresholdRatio", entity="Depth-Finder", config=hyper_params)
+    run = wandb.init(project="Temporal_Diff_Flow_New_SSI", entity="Depth-Finder", config=hyper_params)
 
     lr = hyper_params["learning_rate"]
     #ratio_ssi = hyper_params["ratio_ssi"]
@@ -354,12 +356,12 @@ def train(args):
                 
                 
                 #disp_normed = norm_ssi(y,video_masks)
-                infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)    # 이렇게 나온 결과는 depth임 
+                #infs_fit,_ = least_sqaure_whole_clip(infs=pred,gts=y)    # 이렇게 나온 결과는 depth임 
                 
                 #print("pred: ", pred[0][0])
                 #print("infs_fit: ", infs_fit[0][0])
                 #print("y: ", y[0][0])
-                loss_tgm_value = loss_tgm(infs_fit, y, video_masks_squeezed)
+                loss_tgm_value = loss_tgm(pred, y, video_masks_squeezed)
                 
                 # =============== single img =================== # 
                 img_disp_normed = norm_ssi(y_image,img_masks)
@@ -438,7 +440,7 @@ def train(args):
                 
                 with torch.no_grad():
                     B, T, C, H, W = x.shape
-                    save_dir = f"outputs/check_BW/{exp_name}/frames/test/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/modified_ssi/{exp_name}/frames/test/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
 
                     #with autocast():
@@ -450,12 +452,15 @@ def train(args):
                     pred_clip  = infs_fit[0]       # [T, 1, H, W]
                     
                     for t in range(T):
+                        """
                         # --- a) RGB 저장 ---
                         rgb_frame = rgb_clip[t]  # [3, H, W], 값 ∈ [0,1]
                         rgb_np = (rgb_frame.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)  # [H, W, 3]
                         rgb_pil = Image.fromarray(rgb_np)
                         rgb_out = os.path.join(save_dir, f"rgb_frame_{t:02d}.png")
                         rgb_pil.save(rgb_out)
+                        
+                        """
 
                         #disp_frame = 1.0 / (disp_clip[t, 0] + 1e-6)          # [H, W]
                         #print(disp_frame.min().item(), disp_frame.max().item())
@@ -475,16 +480,6 @@ def train(args):
                         mask_pil = Image.fromarray(mask_np)
                         mask_out = os.path.join(save_dir, f"mask_frame_{t:02d}.png")
                         mask_pil.save(mask_out)
-
-                        # --- d) Prediction 저장 ---
-                        # pred_clip[t] : [H, W], float16/float32 (raw 예측값, 스케일 미정)
-                        pred_frame = pred_clip[t].cpu().float().numpy()  # → np.float32, shape=[H, W]
-                        #pred_norm = (pred_frame - pmin) / (pmax - pmin+1e-9)
-                        pred_uint8 = (pred_frame * 255.0).astype(np.uint8)  # [H, W]
-                        pred_rgb_np = np.stack([pred_uint8]*3, axis=-1)   # [H, W, 3]
-                        pred_pil = Image.fromarray(pred_rgb_np)
-                        pred_out = os.path.join(save_dir, f"pred_frame_{t:02d}.png")
-                        pred_pil.save(pred_out)
                         
                         # --- e) Prediction 저장 ---
                         # pred_clip[t] : [H, W], float16/float32 (raw 예측값, 스케일 미정)
@@ -575,7 +570,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     experiments = [
-        {"ratio_ssi": 1.0, "static_th" : 0.00005, "ratio_tgm": 0.0, "ratio_ssi_image": 0.5},
+
+        {"ratio_ssi": 1.0, "static_th" : 0.05, "ratio_tgm": 10.0, "ratio_ssi_image": 0.5},
         #{"ratio_ssi": 1.0, "static_th" : 0.003, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
         #{"ratio_ssi": 1.0, "static_th" : 0.005, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
         #{"ratio_ssi": 1.0, "static_th" : 0.007, "ratio_tgm": 1.0, "ratio_ssi_image": 0.5},
@@ -584,7 +580,7 @@ if __name__ == "__main__":
     ]
 
     for exp in experiments:
-        for trial in range(5):  # 각 실험마다 3회 반복
+        for trial in range(3):  # 각 실험마다 3회 반복
             # argparse 로 받은 기본 args 복사
             run_args = argparse.Namespace(**vars(args))
 
