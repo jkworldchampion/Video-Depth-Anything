@@ -14,8 +14,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from utils.loss_MiDas import *
-#from utils.loss_MiDas import MaskedScaleShiftInvariantLoss
-#from data.VKITTI import KITTIVideoDataset
 from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
 from video_depth_anything.video_depth import VideoDepthAnything
 from benchmark.eval.metric import *
@@ -23,10 +21,25 @@ from benchmark.eval.eval_tae import tae_torch
 from PIL import Image
 from data.dataLoader import *
 
+import logging
+
+os.makedirs("logs", exist_ok=True)
+
+# 2. configure root logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    handlers=[
+        logging.StreamHandler(),                      # console
+        logging.FileHandler("logs/train_log_task2.txt"),    # file
+    ],
+)
+
+logger = logging.getLogger(__name__)
+
 matplotlib.use('Agg')
 
 MAX_DEPTH=80.0
-CLIP_LEN =16
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 MEAN = torch.tensor((0.485,0.456,0.406), device=DEVICE).view(3,1,1)
 STD  = torch.tensor((0.229,0.224,0.225), device=DEVICE).view(3,1,1)
@@ -61,6 +74,16 @@ def least_sqaure_whole_clip(infs,gts):
     X = torch.linalg.lstsq(A, gt_disp_masked).solution  
     scale = X[0].item()
     shift = X[1].item()
+
+    """
+
+    x, y = pred_disp_masked, gt_disp_masked            # [N,1]
+    mx, my = x.mean(), y.mean()
+    cov  = ((x-mx)*(y-my)).sum()
+    var  = ((x-mx)**2).sum()
+    scale = (cov/var).item()
+    shift = (my - scale*mx).item()
+    """
     aligned_pred = scale * infs + shift
     aligned_pred = torch.clamp(aligned_pred, min=1e-3)  ## 근데 왜 1/80 아니고 .,,,???
     #aligned_pred = aligned_pred[valid_mask].view(-1, 1).double()  # [N, 1] 꼴로 맞추기
@@ -103,6 +126,7 @@ def metric_val(infs, gts, poses, Ks):
     return absrel,delta1,tae
 
 
+
 def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
     
     error_sum = 0.
@@ -137,8 +161,39 @@ def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
     
     result = error_sum / (2 * (len(pred_depth) -1))
     return result
-    
-    
+
+"""
+
+def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
+    error_sum = 0.
+    B = len(pred_depth)
+    for i in range(B - 1):
+        depth1, depth2 = pred_depth[i], pred_depth[i+1]
+        mask1, mask2 = masks[i],     masks[i+1]
+        T1,   T2     = poses[i],     poses[i+1]
+        K = Ks[i]
+
+        R1, t1 = T1[:3,:3], T1[:3,3]    # [3,3], [3]
+        R2, t2 = T2[:3,:3], T2[:3,3]
+        R2_inv = R2.transpose(0,1)      # R2^T
+        t2_inv = - R2_inv @ t2          # -R2^T t2
+
+        R_2_1 = R2_inv @ R1             # [3,3]
+        t_2_1 = R2_inv @ (t1 - t2)      # [3]
+
+        error1 = tae_torch(depth1, depth2, R_2_1, t_2_1, K, mask2)
+
+        R_1_2 = R_2_1.transpose(0,1)    # (R₂₁)^T
+        t_1_2 = - R_1_2 @ t_2_1         # -R₂₁^T t₂₁
+        error2 = tae_torch(depth2, depth1, R_1_2, t_1_2, K, mask1)
+
+        error_sum += error1 + error2
+
+    return error_sum / (2 * (B - 1))
+
+"""
+
+
 def get_mask(depth_m, min_depth, max_depth):
     valid_mask = (depth_m > min_depth) & (depth_m < max_depth)
     return valid_mask.bool()
@@ -169,6 +224,37 @@ def norm_ssi(depth, valid_mask):
 
     return norm_disp
     
+# clip 단위의 scale-shift를 위해
+def norm_ssi_clip(depth, valid_mask, eps=1e-6):
+    """
+    Clip-level min/max normalization of disparity for SSI loss.
+    depth:   [B, T, 1, H, W]  (meters)
+    valid_mask: same shape boolean
+    returns norm_disp: [B, T, 1, H, W] in [0,1]
+    """
+    # 1) compute raw disparity
+    disp = torch.zeros_like(depth)
+    disp[valid_mask] = 1.0 / depth[valid_mask]
+
+    B, T, C, H, W = disp.shape
+    # 2) flatten per sample across all T×H×W
+    disp_flat = disp.view(B, -1)              # [B, P]
+    mask_flat = valid_mask.view(B, -1)        # [B, P]
+
+    # 3) per-clip min and max (ignoring invalid pixels)
+    disp_min = disp_flat.masked_fill(~mask_flat, float('inf')).min(dim=1)[0]  # [B]
+    disp_max = disp_flat.masked_fill(~mask_flat, float('-inf')).max(dim=1)[0] # [B]
+
+    # 4) reshape back to [B,1,1,1,1] so we can broadcast
+    disp_min = disp_min.view(B, 1, 1, 1, 1)
+    disp_max = disp_max.view(B, 1, 1, 1, 1)
+
+    # 5) normalize entire clip with the same min/max
+    norm = (disp - disp_min) / (disp_max - disp_min + eps)
+    # 6) zero out invalid again
+    norm = norm.masked_fill(~valid_mask, 0.0)
+    return norm
+
     
 def train(args):
 
@@ -192,6 +278,7 @@ def train(args):
     num_epochs = hyper_params["epochs"]
     patient = hyper_params["patient"]
     batch_size = hyper_params["batch_size"]
+    CLIP_LEN = hyper_params["clip_len"]
     #conv_out_channel = hyper_params["conv_out_channel"] 
     #conv = hyper_params["conv"]
     diff = args.diff
@@ -285,14 +372,14 @@ def train(args):
 
     # multi GPUs setting
     if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
+        logger.info(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
         model = torch.nn.DataParallel(model)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=lr,weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print("Total parameters:", total_params)
+    logger.info(f"Total parameters: {total_params}")
 
     loss_tgm = LossTGMVector(static_th=0.05)
     loss_ssi = Loss_ssi()
@@ -305,11 +392,15 @@ def train(args):
 
     scaler = GradScaler()
 
+    torch.backends.cuda.preferred_linalg_library('cusolver')
+
     ### 4. train
     
-    print("train_loader_len ", len(train_loader))
+    logger.info(f"train_loader_len: {len(train_loader)}")
 
-    for epoch in range(num_epochs):
+    start_epoch = 0
+    for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
+        print()
         epoch_loss = 0.0
         
         model.train()
@@ -340,7 +431,7 @@ def train(args):
                 #print("pred: ", pred)
                 #print("gt :", y)
                 print("")
-                print("video : pred.mean():", pred.mean().item())
+                logger.info(f"video : pred.mean(): {pred.mean().item():.6f}")
                 #print("image : pred.mean():", pred_image.mean().item())
                 #print("valid_mask.sum():", masks_squeezed.sum().item())
                 #print("y.sum():", y.sum().item())
@@ -348,7 +439,7 @@ def train(args):
                 #print("pred_sum = 0, see GT : ",y[0][0])
                 
                 pred_image = model(x_image)
-                print("image : pred.mean():", pred_image.mean().item())
+                logger.info(f"image : pred.mean(): {pred_image.mean().item():.6f}")
             
                 
                 #print("pred.isnan().any():", torch.isnan(pred).any().item())
@@ -363,7 +454,10 @@ def train(args):
                 #loss_tgm_val = loss_tgm(pred_masked, y_masked, masks_squeezed)
                 
                 # 이거 norm_ssi 갔다오면 disp로 줌 
-                disp_normed = norm_ssi(y,video_masks)
+                # disp_normed = norm_ssi(y,video_masks)
+
+                # clip-level SSI normalization
+                disp_normed = norm_ssi_clip(y, video_masks)
                 video_masks_squeezed = video_masks.squeeze(2)
                 loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)   ## 어차피 5->4 는 loss에서 해줌 
                 
@@ -380,12 +474,21 @@ def train(args):
                 img_disp_normed = norm_ssi(y_image,img_masks)
                 img_masks_squeezed = img_masks.squeeze(2)
                 loss_ssi_image_value = loss_ssi(pred_image, img_disp_normed, img_masks_squeezed)
+
+
+                # =============== pred.mean loss 계산 =============== #
+                gt_disp = (1.0 / y.clamp(min=1e-6)).squeeze(2)    # [B, T, H, W]
+                mean_pred = pred.mean()
+                mean_gt   = gt_disp.mean()
+                loss_mean = torch.abs(mean_pred - mean_gt)
                 
                 #if epoch < 5 : 
                 #    loss = ratio_ssi * loss_ssi_value + ratio_ssi_image * loss_ssi_image_value
                 
                 #else :
                 loss = ratio_tgm * loss_tgm_value + ratio_ssi * loss_ssi_value + ratio_ssi_image * loss_ssi_image_value
+                # loss += 0.01 * loss_mean  # mean loss 추가
+                
                 #print(">> loss.shape:", loss.shape)
                 #print("check ",loss_tgm_value,loss_ssi_value,loss_ssi_image_value)
                 #loss = loss_tgm_val * 0.1 + loss_ssi_val
@@ -405,13 +508,13 @@ def train(args):
             epoch_loss += loss.item()
 
             if batch_idx % 5 == 0:
-                print(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
+                logger.info(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
             
         avg_train_loss = epoch_loss / len(train_loader)
         
         scheduler.step()
 
-        print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {avg_train_loss:.4f}")        
+        logger.info(f"Epoch [{epoch}/{num_epochs}] Train Loss: {avg_train_loss:.4f}")    
         
         # === validation loop ===
         model.eval()
@@ -436,7 +539,7 @@ def train(args):
                 tgm_loss_val  = loss_tgm(pred, y, masks)
                 val_loss     += ratio_ssi * ssi_loss_val + ratio_tgm * tgm_loss_val
 
-                print("pred.mean():", pred.mean().item())
+                logger.info(f"pred.mean(): {pred.mean().item():.6f}")
 
                 # 3) prepare for scale & shift
                 B, T, H, W = pred.shape
@@ -450,21 +553,59 @@ def train(args):
                 p_flat   = raw_disp.view(B, -1)               # [B, P]
                 g_flat   = gt_disp .view(B, -1)               # [B, P]
 
-                # 4) build A, b for least-squares: A @ [a; b] ≈ b_vec
-                A     = torch.stack([p_flat, torch.ones_like(p_flat, device=device)], dim=-1)  # [B,P,2]
-                A     = A * m_flat.unsqueeze(-1)                                             # mask out invalid
-                b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)                          # [B,P,1]
-
-                # 5) batched least-squares
+            
+                # 4) build A, b for least-squares: A @ [a; b] ≈ b_vec 
+                A = torch.stack([p_flat, torch.ones_like(p_flat, device=device)], dim=-1)  # [B,P,2]
+                A = A * m_flat.unsqueeze(-1)    
+                b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)  # mask out invalid
+                
+                 # 5) batched least-squares
                 X = torch.linalg.lstsq(A, b_vec).solution  # [B,2,1]
                 a = X[:,0,0].view(B,1,1,1)                 # [B,1,1,1]
                 b = X[:,1,0].view(B,1,1,1)                 # [B,1,1,1]
 
                 aligned_disp = (raw_disp * a + b).clamp(min=MIN_DISP, max=MAX_DISP)  # [B,T,H,W]
 
+                """
+                AtA = torch.matmul(A.transpose(-2, -1), A)
+                Atb = torch.matmul(A.transpose(-2, -1), b_vec)# [B,P,1]
+                X = torch.linalg.solve(AtA, Atb)
+                
+                a = X[:, 0, 0].view(B, 1, 1, 1)  # [B,1,1,1]
+                b = X[:, 1, 0].view(B, 1, 1, 1)  # [B,1,1,1]
+                
+                aligned_disp = (raw_disp * a + b).clamp(min=MIN_DISP, max=MAX_DISP)
+                
+
+                # 2) 유효 픽셀 개수
+                count = m_flat .sum(dim=1)                   # [B]
+                
+                # 3) 평균 계산
+                sum_x = (p_flat  * m_flat).sum(dim=1)             # [B]
+                sum_y = (g_flat  * m_flat).sum(dim=1)             # [B]
+                mx    = sum_x / count                  # [B]
+                my    = sum_y / count                  # [B]
+                
+                # 4) 공분산·분산 계산 (unnormalized)
+                cov = ((p_flat - mx.unsqueeze(1)) * (g_flat - my.unsqueeze(1)) * m_flat ).sum(dim=1)   # [B]
+                var = ((p_flat - mx.unsqueeze(1))**2 * m_flat ).sum(dim=1)                       # [B]
+                
+                # 5) scale & shift
+                scale = cov / (var + 1e-6)             # [B]  (eps로 나눗셈 안정화)
+                shift = my - scale * mx                # [B]
+                
+                # 6) reshape back to broadcastable
+                a = scale.view(B, 1, 1, 1)             # [B,1,1,1]
+                b = shift.view(B, 1, 1, 1)             # [B,1,1,1]
+                
+                # 7) 최종 정렬된 disparity
+                aligned_disp = (raw_disp * a + b).clamp(min=MIN_DISP, max=MAX_DISP)  # [B, T, H, W]
+
+                """
+                
                 # 4) 첫 배치에만 프레임 저장
                 if batch_idx == 0:
-                    save_dir = f"outputs/diff_{diff}_conv_{conv}_ch_{conv_out_channel}/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/task2/diff_{diff}_conv_{conv}_ch_{conv_out_channel}/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
                     wb_images = []  # W&B 에 보낼 이미지 리스트
                     for t in range(T):
@@ -507,7 +648,7 @@ def train(args):
                         # e) pred-disparity wandb에 저장
                         wb_images.append(wandb.Image(os.path.join(save_dir, f"pred_{t:02d}.png"), caption=f"pred_epoch{epoch}_frame{t:02d}"))
 
-                    print(f"→ saved validation frames to '{save_dir}'")
+                    logger.info(f"→ saved validation frames to '{save_dir}'")
 
                 # 5) metric 평가 (모든 배치에 대해)
                 for b in range(B):
@@ -528,10 +669,10 @@ def train(args):
             avg_delta1   = total_delta1 / cnt_clip
             avg_tae      = total_tae / cnt_clip
 
-        print(f"Epoch [{epoch}/{num_epochs}] Validation Loss: {avg_val_loss:.4f}")
-        print(f"AbsRel  : {avg_absrel:.4f}")
-        print(f"Delta1  : {avg_delta1:.4f}")
-        print(f"TAE    : {avg_tae:.4f}")
+        logger.info(f"Epoch [{epoch}/{num_epochs}] Validation Loss: {avg_val_loss:.4f}")
+        logger.info(f"AbsRel  : {avg_absrel:.4f}")
+        logger.info(f"Delta1  : {avg_delta1:.4f}")
+        logger.info(f"TAE    : {avg_tae:.4f}")
 
         wandb.log({
             "train_loss": avg_train_loss,
@@ -559,7 +700,7 @@ def train(args):
                 'best_epoch': best_epoch,
                 'trial': trial,
             }, filename)
-            print(f"Best checkpoint saved at epoch {epoch+1} with validation loss {avg_val_loss:.4f}")
+            logger.info(f"Best checkpoint saved at epoch {epoch+1} with validation loss {avg_val_loss:.4f}")
             trial = 0
         else:
             trial += 1
@@ -572,7 +713,7 @@ def train(args):
         """
     # 최종 모델 저장
 
-    print(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
+    logger.info(f"Training finished. Best checkpoint was from epoch {best_epoch} with validation loss {best_val_loss:.4f}.")
     run.finish()
 
 import argparse

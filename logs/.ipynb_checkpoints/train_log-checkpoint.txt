@@ -1,0 +1,4 @@
+2025-06-18 09:12:59,625 INFO     using MLP layer as FFN
+2025-06-18 09:13:00,384 INFO     Using 2 GPUs via DataParallel
+2025-06-18 09:13:00,389 INFO     Total parameters: 29052993
+2025-06-18 09:13:00,393 INFO     train_loader_len: 550

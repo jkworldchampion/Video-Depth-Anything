@@ -99,9 +99,15 @@ class GoogleLandmarksDataset(Dataset):
 
         # mask 계산: disparity < 1/80 또는 > 1000
         mask_bool = np.logical_or(disp < (1.0/80.0), disp > 1000.0)
-        image_mask = torch.from_numpy((~mask_bool).astype(np.float32)).unsqueeze(0)
+        image_mask = torch.from_numpy(mask_bool).unsqueeze(0)
+        
+        # [0,1] 범위로 정규화
+        if y_image.max() > y_image.min():
+            disparity_norm = (y_image - y_image.min()) / (y_image.max() - y_image.min() + 1e-8)
+        else:
+            disparity_norm = y_image
 
-        return x_image, y_image, image_mask
+        return x_image, disparity_norm, image_mask
 
 
 class CombinedDataset(Dataset):
@@ -119,7 +125,7 @@ class CombinedDataset(Dataset):
         )
 
     def __len__(self):
-        return max(len(self.kitti), len(self.google))
+        return min(len(self.kitti), len(self.google))
 
     def __getitem__(self, idx):
         k_idx = idx % len(self.kitti)

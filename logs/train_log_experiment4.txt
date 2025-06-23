@@ -1,0 +1,42 @@
+2025-06-23 18:55:17,826 INFO     using MLP layer as FFN
+2025-06-23 18:55:18,450 INFO     Loading pretrained weights from video_depth_anything_vits.pth
+2025-06-23 18:55:20,421 WARNING  Skipped loading 8 params (shape mismatch):
+  head.motion_modules.3.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  head.motion_modules.2.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.0.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.0.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  head.motion_modules.1.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  …
+2025-06-23 18:55:20,422 INFO     ✅ Pretrained weights loaded (filtered).
+2025-06-23 18:55:20,423 INFO     ✅ Pretrained weights loaded.
+2025-06-23 18:55:20,424 INFO     Using 2 GPUs via DataParallel
+2025-06-23 18:55:20,427 INFO     Total parameters: 29697473
+2025-06-23 18:55:20,434 INFO     train_loader_len: 550
+2025-06-23 18:59:54,023 INFO     using MLP layer as FFN
+2025-06-23 18:59:54,655 INFO     Loading pretrained weights from video_depth_anything_vits.pth
+2025-06-23 18:59:55,233 WARNING  Skipped loading 8 params (shape mismatch):
+  head.motion_modules.1.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.3.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.2.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.2.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  head.motion_modules.3.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  …
+2025-06-23 18:59:55,234 INFO     ✅ Pretrained weights loaded (filtered).
+2025-06-23 18:59:55,235 INFO     ✅ Pretrained weights loaded.
+2025-06-23 18:59:55,237 INFO     Using 2 GPUs via DataParallel
+2025-06-23 18:59:55,240 INFO     Total parameters: 29697473
+2025-06-23 18:59:55,246 INFO     train_loader_len: 550
+2025-06-23 19:01:40,933 INFO     using MLP layer as FFN
+2025-06-23 19:01:41,523 INFO     Loading pretrained weights from video_depth_anything_vits.pth
+2025-06-23 19:01:42,082 WARNING  Skipped loading 8 params (shape mismatch):
+  head.motion_modules.1.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  head.motion_modules.3.temporal_transformer.transformer_blocks.0.attention_blocks.0.pos_encoder.pe
+  head.motion_modules.1.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.0.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  head.motion_modules.3.temporal_transformer.transformer_blocks.0.attention_blocks.1.pos_encoder.pe
+  …
+2025-06-23 19:01:42,083 INFO     ✅ Pretrained weights loaded (filtered).
+2025-06-23 19:01:42,084 INFO     ✅ Pretrained weights loaded.
+2025-06-23 19:01:42,086 INFO     Using 2 GPUs via DataParallel
+2025-06-23 19:01:42,090 INFO     Total parameters: 29697473
+2025-06-23 19:01:42,098 INFO     train_loader_len: 550

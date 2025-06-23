@@ -6,7 +6,6 @@ import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
-
 def get_random_crop_params(img, output_size):
     """
     랜덤으로 정사각형 영역을 잘라내기 위한 좌표를 반환합니다.
@@ -18,6 +17,7 @@ def get_random_crop_params(img, output_size):
     i = random.randint(0, h - th)
     j = random.randint(0, w - tw)
     return i, j, th, tw
+
 
     
 class KITTIVideoDataset(Dataset):
