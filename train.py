@@ -213,8 +213,6 @@ def train():
 
         print(f"Epoch [{epoch}/{num_epochs}] Train Loss: {epoch_loss:.4f}")
         
-        wandb.log({"train_loss": avg_train_loss, "epoch": epoch})
-        
         # === validation loop ===
         model.eval()
         val_loss = 0.0
@@ -275,23 +273,34 @@ def train():
                         rgb_np   = (rgb_unc.cpu().permute(1,2,0).numpy() * 255).astype(np.uint8)
                         Image.fromarray(rgb_np).save(os.path.join(save_dir, f"rgb_{t:02d}.png"))
 
-                        # b) GT Disparity 저장 (depth→disparity → clamp[0,1] → 0–255)
-                        depth_frame = y[0, t].squeeze(0).clamp(min=1e-6)        # [H,W]
-                        disp_frame  = (1.0 / depth_frame).clamp(0,1)            # [H,W]
-                        disp_np     = (disp_frame.cpu().numpy() * 255).astype(np.uint8)
-                        disp_rgb_np = np.stack([disp_np]*3, axis=-1)
-                        Image.fromarray(disp_rgb_np).save(os.path.join(save_dir, f"gt_{t:02d}.png"))
+                        # b) GT Disparity 저장 (Min–Max 정규화)
+                        depth_frame = y[0, t].squeeze(0).clamp(min=1e-6)       # [H,W]
+                        disp_frame  = 1.0 / depth_frame                       # [H,W]
+                        valid       = masks[0, t].squeeze(0)                  # [H,W] bool
+
+                        # 유효 픽셀만 뽑아 min/max
+                        d_vals = disp_frame[valid]
+                        d_min, d_max = d_vals.min(), d_vals.max()
+
+                        norm_gt = (disp_frame - d_min) / (d_max - d_min + 1e-6)
+                        norm_gt = norm_gt.clamp(0,1)
+
+                        gt_uint8 = (norm_gt.cpu().numpy() * 255).astype(np.uint8)
+                        gt_rgb   = np.stack([gt_uint8]*3, axis=-1)
+                        Image.fromarray(gt_rgb).save(os.path.join(save_dir, f"gt_{t:02d}.png"))
 
                         # c) Mask 저장
                         mask_frame = masks[0, t].squeeze(0).cpu().numpy().astype(np.uint8) * 255
                         Image.fromarray(mask_frame).save(os.path.join(save_dir, f"mask_{t:02d}.png"))
+                        
+                        # d) Predicted Disparity 저장 (같은 Min–Max 사용)
+                        pred_frame = aligned_disp[0, t]  # [H,W]
+                        norm_pd = (pred_frame - d_min) / (d_max - d_min + 1e-6)
+                        norm_pd = norm_pd.clamp(0,1)
 
-                        # d) Predicted Disparity 저장 (aligned_disp already disparity)
-                        pred_frame = aligned_disp[0, t].cpu().numpy()           # [H,W]
-                        pred_clamped = np.clip(pred_frame, 0.0, 1.0)            # [H,W]
-                        pred_uint8   = (pred_clamped * 255).astype(np.uint8)
-                        pred_rgb_np  = np.stack([pred_uint8]*3, axis=-1)
-                        Image.fromarray(pred_rgb_np).save(os.path.join(save_dir, f"pred_{t:02d}.png"))
+                        pd_uint8 = (norm_pd.cpu().numpy() * 255).astype(np.uint8)
+                        pd_rgb   = np.stack([pd_uint8]*3, axis=-1)
+                        Image.fromarray(pd_rgb).save(os.path.join(save_dir, f"pred_{t:02d}.png"))
                         
                         # e) pred-disparity wandb에 저장
                         wb_images.append(wandb.Image(os.path.join(save_dir, f"pred_{t:02d}.png"), caption=f"pred_epoch{epoch}_frame{t:02d}"))
