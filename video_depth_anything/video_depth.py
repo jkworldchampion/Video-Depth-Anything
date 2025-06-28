@@ -93,6 +93,12 @@ class VideoDepthAnything(nn.Module):
         #print("f1",features[0][0].shape)
 
         if self.diff :
+
+            x_flat = x.view(-1, C, H, W)
+            for layer in self.diff_layers:
+                x_flat = layer(x_flat)
+            x = x_flat.view(B, T, self.out_channel, H, W)
+            C = self.out_channel
             diff = []
     
             for idx in range(B):
@@ -106,11 +112,11 @@ class VideoDepthAnything(nn.Module):
     
             #print("diff_flat",diff_flat[0])
             #print("diff_flat_shape",diff_flat.shape)
-    
+            """
             if self.conv:
                 for layer in self.diff_layers:
                     diff_flat = layer(diff_flat)
-    
+            """
             #print("diff_flat after conv",diff_flat.shape)
             
             pooled = F.adaptive_avg_pool2d(diff_flat,(patch_h, patch_w)) ## cnn으로도 가능 .. 

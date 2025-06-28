@@ -106,7 +106,7 @@ def get_kitti_paths(video_info, clip_len, split):
                 end_idx.append()
                 break
 
-            x_clips.append([os.path.join(rgb_dir,   f) for f in rgb_files[start:end]])
+            x_clips.append([os.path.join(rgb_dir, f) for f in rgb_files[start:end]])
             y_clips.append([os.path.join(depth_dir, f) for f in depth_files[start:end]])
             intrin_clips.append(intrinsic_file)
             extrin_clips.append(extrinsic_file)
@@ -198,6 +198,10 @@ def get_kitti_video_path(root_dir, condition_num, split, binocular):
             continue
 
         for idx, condition in enumerate(sorted(os.listdir(scene_rgb_path))):
+            
+            if condition not in {"15-deg-left", "30-deg-left","15-deg-right", "30-deg-right"}:
+                continue
+                
             print(f"Processing scene: {scene}, condition: {condition}")
             cond_rgb_path = os.path.join(scene_rgb_path, condition)
             cond_depth_path = os.path.join(scene_depth_path, condition)

@@ -10,15 +10,14 @@ import gc
 import argparse
 from dotenv import load_dotenv
 
-
 from torch.utils.data import DataLoader 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from utils.loss_MiDas import *
 from data.Google_Landmark import GoogleLandmarksDataset, CombinedDataset
-# from video_depth_anything.video_depth import VideoDepthAnything
-from video_depth_anything.video_depth_my import VideoDepthAnything  # 내 것으로 변경
+from video_depth_anything.video_depth import VideoDepthAnything
+#from video_depth_anything.video_depth_my import VideoDepthAnything  # 내 것으로 변경
 
 from benchmark.eval.metric import *
 from benchmark.eval.eval_tae import tae_torch
@@ -197,7 +196,7 @@ def train(args):
         conv_out_channel = args.conv_out_channel
         hyper_params["conv_out_channel"] = args.conv_out_channel
         
-        filename = f"diff_model_with_conv_{conv}_{conv_out_channel}.pth"
+        filename = f"diff_model_with_conv_{conv_out_channel}.pth"
         
     else :
         conv_out_channel=0
@@ -205,7 +204,7 @@ def train(args):
         filename = "basic_model.pth"
 
     
-    run = wandb.init(project="Temporal_Diff_Flow_experiment", entity="Depth-Finder", config=hyper_params)
+    run = wandb.init(project="Temporal_Diff_Flow_experiment_6_24", entity="Depth-Finder", config=hyper_params)
     
     ### 2. Load data
 
@@ -316,7 +315,7 @@ def train(args):
     logger.info(f"Total parameters: {total_params}")
 
     loss_tgm = LossTGMVector(static_th=0.05)
-    loss_ssi = Loss_ssi()
+    loss_ssi = Loss_ssi_basic()
 
     wandb.watch(model, log="all")
 
@@ -368,7 +367,6 @@ def train(args):
                 video_masks_squeezed = video_masks.squeeze(2)
                 loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)   ## 어차피 5->4 는 loss에서 해줌 
 
-                
                 loss_tgm_value = loss_tgm(pred, y, video_masks_squeezed)
                 
                 # =============== single img =================== # 
@@ -445,7 +443,7 @@ def train(args):
                 
                 # 4) 첫 배치에만 프레임 저장
                 if batch_idx == 0:
-                    save_dir = f"outputs/experiment4/diff_{diff}_conv_{conv}_ch_{conv_out_channel}/epoch_{epoch}_batch_{batch_idx}"
+                    save_dir = f"outputs/experiment4/diff_{diff}_conv_ch_{conv_out_channel}/epoch_{epoch}_batch_{batch_idx}"
                     os.makedirs(save_dir, exist_ok=True)
                     wb_images = []  # W&B 에 보낼 이미지 리스트
                     for t in range(T):

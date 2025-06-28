@@ -6,7 +6,7 @@ def abs_relative_difference(output, target, valid_mask=None):
     abs_relative_diff = torch.abs(actual_output - actual_target) / actual_target
     if valid_mask is not None:
         abs_relative_diff[~valid_mask] = 0
-        n = valid_mask.sum((-1, -2))
+        n = valid_mask.sum((-1, -2))    ## 32 x H x W 에서 
     else:
         n = output.shape[-1] * output.shape[-2]
     abs_relative_diff = torch.sum(abs_relative_diff, (-1, -2)) / n

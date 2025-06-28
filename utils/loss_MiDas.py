@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Loss_ssi_basic(nn.Module):
     # DA와는 다르게, 들어오는 차원이 B x N x 1 x H x W 임 !!
@@ -17,7 +18,7 @@ class Loss_ssi_basic(nn.Module):
         B, N, H, W = mask.shape
 
         flat_d    = d.view(B * N, H * W)
-        flat_mask = mask.view(B * N, H * W)
+        flat_mask = mask.contiguous().view(B * N, H * W)
 
         medians = torch.zeros((B * N,), device=d.device, dtype=d.dtype)
         scales  = torch.zeros((B * N,), device=d.device, dtype=d.dtype)
@@ -55,6 +56,33 @@ class Loss_ssi_basic(nn.Module):
         diff = torch.abs(self._d_hat(pred, mask) - self._d_hat(y, mask))
         return diff 
 
+    def _grad_loss(self, pred, target, mask):
+        total = 0.0
+        ## R이 scale map -> 4 scale level로 나눴다. 즉 4면 2^4 = 16
+        for s in range(4):
+            if s > 0:
+                k = 2 ** s
+                p = F.avg_pool2d(pred, k, stride=k)
+                t = F.avg_pool2d(target, k, stride=k)
+                m = F.avg_pool2d(mask.float(), k, stride=k).bool()
+            else:
+                p, t, m = pred, target, mask
+
+            diff = p - t
+            gx = (diff[..., :, 1:] - diff[..., :, :-1]).abs()
+            gy = (diff[..., 1:, :] - diff[..., :-1, :]).abs()
+
+            mx = m[..., :, 1:] & m[..., :, :-1]
+            my = m[..., 1:, :] & m[..., :-1, :]
+
+            ## 둘이 혹시나 다를 수도 있나? 일단 쪼개서
+            lx = (gx * mx).sum() / mx.sum().clamp(min=1.0)
+            ly = (gy * my).sum() / my.sum().clamp(min=1.0)
+            
+            total += lx + ly
+
+        return total / 4
+        
     def forward(self, pred, y, masks_squeezed):
         # mask 차원 : [B, T, H, W]
         if pred.dim() == 5 and pred.shape[2] == 1:
@@ -68,13 +96,19 @@ class Loss_ssi_basic(nn.Module):
         rho = self._rho(pred, y, masks_squeezed)        ## 리턴차원 : B T H W
         rho[~masks_squeezed] = 0
 
-        valid_counts = masks_squeezed.sum(dim=-1).clamp_min(1.0)  # 이 부분에서 현재 W마다 mask가 적용된 픽셀을 계산
-        loss_per_image = rho.sum(dim=-1) / valid_counts
-        loss_ssi = loss_per_image.mean()
+        valid_counts = masks_squeezed.sum(dim=(2, 3)).clamp_min(1.0) 
+        sum_rho      = rho.sum(dim=(2, 3))                   
+        loss_per_frame = sum_rho / valid_counts              
+        loss_ssi       = loss_per_frame.mean()                      
+        
+        loss_grad = self._grad_loss(self._d_hat(pred,masks_squeezed), self._d_hat(y,masks_squeezed), masks_squeezed)
+        total = loss_ssi + 0.5 * loss_grad
 
         print("SSI Loss per batch:", loss_ssi.item())
 
-        return loss_ssi
+        return total
+
+
 
 class Loss_ssi(nn.Module):
     # DA와는 다르게, 들어오는 차원이 B x N x 1 x H x W 임 !!

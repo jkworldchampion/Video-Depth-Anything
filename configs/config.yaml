@@ -4,7 +4,7 @@ hyper_parameter:
   ratio_ssi: 1
   ratio_tgm: 10
   ratio_ssi_image : 0.5
-  epochs: 15
+  epochs: 200
   patient: 5
   batch_size: 2
   conv_out_channel: 64
